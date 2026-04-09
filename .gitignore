@@ -1,0 +1,25 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Logs
+*.log
+
+# Database
+chroma_db/
+
+# Storage data (may contain sensitive uploaded files)
+storage/
+storage_export/
+storage_images/
+storage_md/
+
+# IDE
+.vscode/
+.idea/
