@@ -47,22 +47,72 @@ class DashScopeEmbeddings(Embeddings):
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-        response = httpx.post(
-            f"{self.base_url}/embeddings",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            },
-            json={"model": self.model, "input": texts},
-            timeout=30.0
-        )
-        response.raise_for_status()
-        result = response.json()
-        return [item["embedding"] for item in result["data"]]
+        import time
+
+        # Debug: log what's being sent
+        total_chars = sum(len(t) for t in texts)
+        print(f"[EMBED] Sending {len(texts)} texts, total {total_chars} chars")
+
+        # Retry with exponential backoff
+        for attempt in range(3):
+            try:
+                response = httpx.post(
+                    f"{self.base_url}/embeddings",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={"model": self.model, "input": texts},
+                    timeout=60.0
+                )
+                if response.status_code == 400:
+                    print(f"[EMBED] 400 error, response: {response.text[:300]}")
+                    # Retry once after a short delay
+                    if attempt < 2:
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                response.raise_for_status()
+                result = response.json()
+                return [item["embedding"] for item in result["data"]]
+            except httpx.HTTPStatusError as e:
+                print(f"[EMBED] HTTP error on attempt {attempt+1}: {e.response.status_code}")
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+                else:
+                    raise
+            except Exception as e:
+                print(f"[EMBED] Error on attempt {attempt+1}: {e}")
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+                else:
+                    raise
+
+        # Should not reach here
+        return []
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """批量嵌入文档"""
-        return self._call_api(texts)
+        """批量嵌入文档，支持分批和重试"""
+        # 分批发送，避免单次请求过大
+        batch_size = 10
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            try:
+                batch_embeddings = self._call_api(batch)
+                all_embeddings.extend(batch_embeddings)
+            except Exception as e:
+                print(f"[EMBED] Batch {i//batch_size} failed: {e}")
+                # 尝试逐条发送，定位问题
+                for j, text in enumerate(batch):
+                    try:
+                        emb = self._call_api([text])
+                        all_embeddings.extend(emb)
+                    except Exception as e2:
+                        print(f"[EMBED] Text {i+j} failed: {e2}")
+                        print(f"[EMBED]   Text: {repr(text[:200])}")
+                        # 使用零向量作为fallback
+                        all_embeddings.append([0.0] * 1024)
+        return all_embeddings
 
     def embed_query(self, text: str) -> List[float]:
         """嵌入单个查询"""
@@ -611,47 +661,130 @@ class DocumentParser:
 
     @classmethod
     def parse_docx(cls, file_path: str, doc_id: str = None) -> Tuple[str, List[dict]]:
-        """从 Word .docx 文件提取文本和图片"""
+        """从 Word .docx 文件提取文本和图片（图片插入到正确位置）"""
         from docx import Document
+        import zipfile
 
         if doc_id is None:
             doc_id = uuid.uuid4().hex[:12]
 
         doc = Document(file_path)
+        handler = ImageHandler(doc_id)
+
+        # Step 1: 从 ZIP 提取所有图片并保存，建立 rId -> ImageInfo 映射
+        rId_to_image = {}
+        try:
+            with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                media_files = [f for f in zip_ref.namelist() if f.startswith('word/media/')]
+                for mf in media_files:
+                    fname = os.path.basename(mf)
+                    if fname:
+                        try:
+                            image_data = zip_ref.read(mf)
+                            ext = os.path.splitext(fname)[1].lstrip('.')
+                            img_info = handler.save_image(
+                                image_data=image_data,
+                                original_name=fname,
+                                image_format=ext or 'png'
+                            )
+                            # 用文件名和完整路径都建立映射
+                            rId_to_image[fname] = img_info
+                        except Exception as e:
+                            print(f"提取图片失败 {mf}: {e}")
+        except Exception as e:
+            print(f"无法打开 DOCX ZIP: {e}")
+
+        # Step 2: 建立 rId -> 图片文件名 映射（从文档关系）
+        rId_to_filename = {}
+        for r_id, rel in doc.part.rels.items():
+            if 'image' in str(rel.reltype).lower():
+                target = rel.target_ref
+                rId_to_filename[r_id] = os.path.basename(target)
+
+        # Step 3: 为每个段落收集其图片引用
+        para_image_refs = {}  # para_index -> [img_md, ...]
+        for shape in doc.inline_shapes:
+            try:
+                blip = shape._inline.graphic.graphicData.pic.blipFill.blip
+                r_id = blip.embed
+                fname = rId_to_filename.get(r_id)
+                if fname and fname in rId_to_image:
+                    img = rId_to_image[fname]
+                    img_md = f"![{img.original_name}]({img.stored_path.replace(chr(92), '/')})"
+                    # 从 shape._inline 向上找到 w:p 段落元素
+                    drawing_el = shape._inline.getparent()
+                    current = drawing_el
+                    para_el = None
+                    while current is not None:
+                        if current.tag.endswith('}p'):
+                            para_el = current
+                            break
+                        current = current.getparent()
+                    # 找到对应的段落索引
+                    if para_el is not None:
+                        for p_idx, para in enumerate(doc.paragraphs):
+                            if para._element is para_el:
+                                para_image_refs.setdefault(p_idx, []).append(img_md)
+                                break
+            except Exception:
+                pass
+
+        # Step 4: 遍历段落，插入文本和图片
         paragraphs = []
         mappings = []
         current_pos = 0
 
-        for page_num, para in enumerate(doc.paragraphs, start=1):
+        for para_idx, para in enumerate(doc.paragraphs):
+            # 先插入该段落的图片
+            for img_md in para_image_refs.get(para_idx, []):
+                paragraphs.append(img_md)
+
             text = para.text.strip()
-            if not text:
-                continue
+            if text:
+                # 检测标题样式
+                is_heading = False
+                heading_level = 2
+                if para.style.name.startswith('Heading'):
+                    is_heading = True
+                    level = int(para.style.name[-1]) if para.style.name[-1].isdigit() else 2
+                    heading_level = min(level, 6)
+                elif re.match(r'^[一二三四五六七八九十]+[、.]', text):
+                    is_heading = True
+                    heading_level = 1
+                elif re.match(r'^\d+[、.]\s', text):
+                    is_heading = True
+                    heading_level = 2
+                elif re.match(r'^\d+\.\d+[、.]\s', text):
+                    is_heading = True
+                    heading_level = 3
+                elif re.match(r'^第[一二三四五六七八九十\d]+[章节条]', text):
+                    is_heading = True
+                    heading_level = 1
 
-            if para.style.name.startswith('Heading'):
-                level = int(para.style.name[-1]) if para.style.name[-1].isdigit() else 2
-                prefix = "#" * min(level, 6)
-                text = f"{prefix} {text}"
+                if is_heading:
+                    prefix = "#" * heading_level
+                    text = f"{prefix} {text}"
 
-            start_char = current_pos
-            end_char = current_pos + len(text)
+                start_char = current_pos
+                end_char = current_pos + len(text)
 
-            paragraphs.append(text)
-            mappings.append({
-                "page_num": page_num,
-                "content": text,
-                "start_char": start_char,
-                "end_char": end_char
-            })
+                paragraphs.append(text)
+                mappings.append({
+                    "page_num": len(mappings) + 1,
+                    "content": text,
+                    "start_char": start_char,
+                    "end_char": end_char
+                })
+                current_pos = end_char + 2
 
-            current_pos = end_char + 2
-
+        # 提取表格
         for table in doc.tables:
             for row in table.rows:
                 row_text = " | ".join([cell.text.strip() for cell in row.cells])
                 if row_text:
                     paragraphs.append(f"| {row_text} |")
                     mappings.append({
-                        "page_num": len(paragraphs),
+                        "page_num": len(mappings) + 1,
                         "content": f"| {row_text} |",
                         "start_char": current_pos,
                         "end_char": current_pos + len(row_text) + 4
@@ -660,15 +793,10 @@ class DocumentParser:
 
         md_text = "\n\n".join(paragraphs)
 
-        try:
-            md_with_images, extracted_images = extract_images_from_docx(file_path, doc_id)
-            if extracted_images:
-                save_image_records(doc_id, extracted_images)
-                image_refs = get_image_record_markdown(doc_id)
-                md_text = md_text + "\n\n" + image_refs
-                print(f"从 DOCX 提取了 {len(extracted_images)} 张图片")
-        except Exception as img_err:
-            print(f"DOCX 图片提取失败: {img_err}")
+        # 记录图片
+        if handler.images:
+            save_image_records(doc_id, handler.images)
+            print(f"从 DOCX 提取了 {len(handler.images)} 张图片")
 
         return md_text, mappings
 
@@ -885,7 +1013,8 @@ class RAGEngine:
         self,
         file_path: str,
         file_extension: str,
-        metadata: Optional[dict] = None
+        metadata: Optional[dict] = None,
+        doc_id: Optional[str] = None
     ) -> dict:
         """
         处理文档：解析 -> 切分 -> 入库（Multi-vector Retriever）
@@ -893,6 +1022,9 @@ class RAGEngine:
         实现 Parent-Child 结构：
         - 母文档（完整上下文）存入 docstore
         - 子文档（检索用）存入向量数据库
+
+        Args:
+            doc_id: 可选，外部传入的文档ID（如未提供则自动生成）
 
         Returns:
             dict: {
@@ -903,7 +1035,7 @@ class RAGEngine:
                 "verification_warnings": [...]
             }
         """
-        doc_id = str(uuid.uuid4())
+        doc_id = doc_id or str(uuid.uuid4())
 
         # 解析文档
         markdown_text, page_mappings = DocumentParser.parse_file(file_path, file_extension, doc_id)
@@ -912,14 +1044,28 @@ class RAGEngine:
         from core.image_handler import get_image_records, get_image_record_markdown
         image_records = get_image_records(doc_id)
 
-        # 追加图片引用
+        # 追加图片引用（仅当内容中尚未包含时，如 DOCX 已内联插入）
         if image_records:
             image_refs = get_image_record_markdown(doc_id)
-            if image_refs:
-                markdown_text = markdown_text + "\n\n" + image_refs
+            if image_refs and image_refs.strip() not in markdown_text:
+                # 检查是否已有图片引用内联在内容中
+                existing_img_refs = re.findall(r'!\[.*?\]\(.*?\)', markdown_text)
+                if not existing_img_refs:
+                    markdown_text = markdown_text + "\n\n" + image_refs
 
         # 注入 RAG 语义增强标签到表格
         table_summaries = self._inject_table_rag_tags(markdown_text)
+
+        # 抽取多种表示（结构、知识点等）供文档概览使用
+        try:
+            from core.doc_bot import get_doc_bot_v2
+            doc_bot = get_doc_bot_v2()
+            representations = doc_bot.extractor.extract(markdown_text, doc_id, page_mappings)
+            doc_bot.vector_store.add_representations(representations)
+        except Exception as e:
+            print(f"表示抽取失败: {e}")
+            import traceback
+            traceback.print_exc()
 
         # 切分文档并入库
         self._split_and_index(markdown_text, doc_id, metadata, table_summaries)
@@ -1080,6 +1226,9 @@ class RAGEngine:
             child_docs = child_splitter.split_documents([parent_doc])
 
             for child_doc in child_docs:
+                # 过滤空文本块，防止 DashScope 400 错误
+                if not child_doc.page_content or not child_doc.page_content.strip():
+                    continue
                 child_doc.metadata["parent_id"] = parent_id
                 child_doc.metadata["doc_id"] = doc_id
                 if metadata:

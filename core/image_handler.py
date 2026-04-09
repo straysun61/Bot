@@ -244,18 +244,14 @@ def extract_images_from_pdf(file_path: str, doc_id: str) -> Tuple[str, List[Imag
 
 def extract_images_from_docx(file_path: str, doc_id: str) -> Tuple[str, List[ImageInfo]]:
     """
-    从 Word DOCX 中提取所有图片
-
-    Args:
-        file_path: DOCX 文件路径
-        doc_id: 文档ID
+    从 Word DOCX 中提取所有图片，插入到原文对应位置
 
     Returns:
         Tuple: (markdown_content_with_image_refs, List[ImageInfo])
     """
     try:
         from docx import Document
-        from docx.oxml.ns import qn
+        from docx.opc.constants import RELATIONSHIP_TYPE as RT
     except ImportError:
         logger.warning("python-docx 未安装，无法提取 DOCX 图片")
         return "", []
@@ -266,47 +262,61 @@ def extract_images_from_docx(file_path: str, doc_id: str) -> Tuple[str, List[Ima
     try:
         doc = Document(file_path)
 
-        for para_idx, para in enumerate(doc.paragraphs):
-            text = para.text.strip()
-            if text:
-                md_parts.append(f"{text}\n")
-
-            # 检查段落中的图片 (通过 rId)
-            for run in para.runs:
-                # 获取 inline shapes
-                pass
-
-        # 提取文档级别的图片 (在 rels 中)
-        # DOCX 的图片存储在 word/media/ 目录下
+        # 预处理：从 ZIP 提取所有图片
         import zipfile
-        from lxml import etree
+        with zipfile.ZipFile(file_path, 'r') as zip_ref:
+            media_files = [f for f in zip_ref.namelist() if f.startswith('word/media/')]
+            for mf in media_files:
+                try:
+                    image_data = zip_ref.read(mf)
+                    original_name = os.path.basename(mf)
+                    ext = os.path.splitext(original_name)[1].lstrip('.')
+                    handler.save_image(
+                        image_data=image_data,
+                        original_name=original_name,
+                        image_format=ext or 'png'
+                    )
+                except Exception as e:
+                    logger.warning(f"提取图片失败 {mf}: {e}")
 
-        try:
-            with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                # 列出所有 word/media/ 下的文件
-                media_files = [f for f in zip_ref.namelist() if f.startswith('word/media/')]
+        # 遍历段落，在图片出现的位置插入 Markdown 引用
+        for para in doc.paragraphs:
+            para_text = para.text.strip()
 
-                for media_file in media_files:
-                    try:
-                        image_data = zip_ref.read(media_file)
-                        original_name = os.path.basename(media_file)
-                        ext = os.path.splitext(original_name)[1].lstrip('.')
+            # 检查段落中的 inline shape（图片）
+            for inline_shape in para.inline_shapes:
+                # 获取图片的 rId
+                try:
+                    blip = inline_shape._inline.graphic.graphicData.pic.blipFill.blip
+                    r_id = blip.embed
+                    # 通过 rId 查找对应的图片关系
+                    rel = doc.part.rels.get(r_id)
+                    if rel:
+                        target_name = rel.target_part.partname
+                        # 匹配 handler 中保存的图片
+                        target_basename = os.path.basename(str(target_name))
+                        matched = None
+                        for img in handler.images:
+                            if target_basename in img.stored_path or target_basename in img.original_name:
+                                matched = img
+                                break
+                        if matched:
+                            md_parts.append(f"![{matched.original_name}]({matched.stored_path.replace(chr(92), '/')})\n")
+                except Exception:
+                    pass
 
-                        image_info = handler.save_image(
-                            image_data=image_data,
-                            original_name=original_name,
-                            image_format=ext or 'png'
-                        )
+            if para_text:
+                md_parts.append(f"{para_text}\n")
 
-                        md_parts.append(handler.get_markdown_ref(image_info, f"文档图片{len(handler.images)}"))
-                    except Exception as e:
-                        logger.warning(f"提取 DOCX 图片失败 {media_file}: {e}")
-
-        except zipfile.BadZipFile:
-            logger.warning(f"无法打开 DOCX 文件: {file_path}")
+        # 记录图片
+        if handler.images:
+            save_image_records(doc_id, handler.images)
+            logger.info(f"从 DOCX 提取了 {len(handler.images)} 张图片")
 
     except Exception as e:
         logger.error(f"DOCX 图片提取失败: {e}")
+
+    return "\n".join(md_parts), handler.images
 
     return "\n".join(md_parts), handler.images
 

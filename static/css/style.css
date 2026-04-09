@@ -1030,7 +1030,21 @@ body::before {
 
 .qa-answer {
     margin-bottom: 8px;
-    font-weight: 500;
+    font-weight: 400;
+    line-height: 1.7;
+}
+
+.qa-answer p {
+    margin: 0.4em 0;
+}
+
+.qa-answer ul {
+    margin: 0.4em 0;
+    padding-left: 1.5em;
+}
+
+.qa-answer li {
+    margin: 0.2em 0;
 }
 
 .qa-answer code {
@@ -1039,6 +1053,11 @@ body::before {
     border-radius: 4px;
     font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
     font-size: 0.85em;
+}
+
+.qa-answer strong {
+    font-weight: 600;
+    color: var(--text-primary);
 }
 
 .qa-answer pre {
@@ -1055,6 +1074,15 @@ body::before {
 .qa-answer pre code {
     background: none;
     padding: 0;
+}
+
+.qa-answer .source-ref {
+    font-size: 0.8em;
+    color: var(--text-muted);
+    background: var(--card);
+    padding: 1px 6px;
+    border-radius: 3px;
+    white-space: nowrap;
 }
 
 .qa-reference {

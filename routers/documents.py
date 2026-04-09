@@ -43,7 +43,8 @@ def process_document_task(doc_id: str, file_path: str, file_extension: str, user
         result = rag_engine.process_document(
             file_path=file_path,
             file_extension=file_extension,
-            metadata={"uploaded_by": user}
+            metadata={"uploaded_by": user},
+            doc_id=doc_id
         )
 
         markdown_content = result["markdown"]

@@ -1122,62 +1122,101 @@ function escapeHtml(text) {
 function formatAnswerText(text) {
     if (!text) return '';
 
-    // 如果包含代码块标记 ```，则处理代码块
-    if (text.includes('```')) {
-        // 分割代码块和普通文本
+    let html = escapeHtml(text);
+
+    // 代码块 ``` ... ```
+    if (html.includes('```')) {
         const parts = [];
-        let current = text;
-        let codeBlockCount = 0;
-
-        while (current.includes('```')) {
-            const codeStart = current.indexOf('```');
-            const codeEnd = current.indexOf('```', codeStart + 3);
-
+        let remaining = html;
+        while (remaining.includes('```')) {
+            const codeStart = remaining.indexOf('```');
+            const codeEnd = remaining.indexOf('```', codeStart + 3);
             if (codeEnd === -1) {
-                // 没有闭合标签，剩下的都是普通文本
-                parts.push({ type: 'text', content: escapeHtml(current) });
+                parts.push({ type: 'text', content: remaining });
                 break;
             }
-
-            // 提取代码块前的普通文本
             if (codeStart > 0) {
-                parts.push({ type: 'text', content: escapeHtml(current.substring(0, codeStart)) });
+                parts.push({ type: 'text', content: remaining.substring(0, codeStart) });
             }
-
-            // 提取代码块内容
-            const codeContent = current.substring(codeStart + 3, codeEnd);
-            // 检测语言
+            const codeContent = remaining.substring(codeStart + 3, codeEnd);
             const lines = codeContent.split('\n');
             let language = '';
             let code = codeContent;
-            if (lines[0] && /^[a-zA-Z]+$/.test(lines[0])) {
-                language = lines[0];
+            if (lines[0] && /^[a-zA-Z]+$/.test(lines[0].trim())) {
+                language = lines[0].trim();
                 code = lines.slice(1).join('\n');
             }
-            parts.push({ type: 'code', language: language, content: code });
-
-            // 继续处理剩下的内容
-            current = current.substring(codeEnd + 3);
+            parts.push({ type: 'code', language, content: code });
+            remaining = remaining.substring(codeEnd + 3);
         }
+        if (remaining) parts.push({ type: 'text', content: remaining });
 
-        // 处理剩下的普通文本
-        if (current) {
-            parts.push({ type: 'text', content: escapeHtml(current) });
-        }
-
-        // 组合 HTML
         return parts.map(part => {
             if (part.type === 'code') {
                 const langClass = part.language ? ` class="language-${part.language}"` : '';
-                return `<pre${langClass}><code>${escapeHtml(part.content)}</code></pre>`;
+                return `<pre${langClass}><code>${part.content}</code></pre>`;
             }
-            return part.content;
+            return renderInlineMarkdown(part.content);
         }).join('');
-
-    } else {
-        // 普通文本，直接 HTML 转义
-        return escapeHtml(text);
     }
+
+    return renderInlineMarkdown(html);
+}
+
+function renderInlineMarkdown(text) {
+    if (!text) return '';
+
+    // 按行处理，支持列表
+    const lines = text.split('\n');
+    let html = '';
+    let inList = false;
+
+    for (let line of lines) {
+        if (!line.trim()) {
+            if (inList) { html += '</ul>'; inList = false; }
+            html += '<br>';
+            continue;
+        }
+
+        // 无序列表
+        if (/^[-*]\s+/.test(line.trim())) {
+            if (!inList) { html += '<ul>'; inList = true; }
+            html += `<li>${formatInlineText(line.replace(/^[-*]\s+/, ''))}</li>`;
+            continue;
+        }
+
+        if (inList) { html += '</ul>'; inList = false; }
+
+        // 有序列表
+        if (/^\d+\.\s+/.test(line.trim())) {
+            html += `<p>${formatInlineText(line.replace(/^\d+\.\s+/, ''))}</p>`;
+            continue;
+        }
+
+        html += `<p>${formatInlineText(line)}</p>`;
+    }
+    if (inList) html += '</ul>';
+    return html;
+}
+
+function formatInlineText(text) {
+    if (!text) return '';
+
+    // 内联代码 `code`
+    text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+    // 粗体 **text**
+    text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+    // 斜体 *text*
+    text = text.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+
+    // 来源引用 (来源1, 来源2) -> 小标签
+    text = text.replace(/\(来源(\d+)(?:、来源(\d+))*\)/g, (match) => {
+        return `<span class="source-ref">${match}</span>`;
+    });
+
+    return text;
 }
 
 // 获取状态文字
