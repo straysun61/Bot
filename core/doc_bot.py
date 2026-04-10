@@ -285,10 +285,13 @@ class MultiRepresentationExtractor:
             heading_tree.append({"level": level, "title": h[1]})
 
         if not headings:
-            numbered_sections = re.findall(r'^(\d+)\s*\n(.+)$', md_content, re.MULTILINE)
-            for idx, (num, title) in enumerate(numbered_sections):
-                toc_lines.append(f"- {title}")
-                heading_tree.append({"level": 1, "title": title, "number": num})
+            # 匹配格式如 "1.1 在OEM中创建..." 或 "任务1：..." 或 "三、实验内容"
+            numbered_sections = re.findall(r'^(\d+[.、：:]\s*[^\n]{0,80})', md_content, re.MULTILINE)
+            for sec in numbered_sections:
+                sec = sec.strip()
+                if len(sec) > 5:  # 过滤太短的匹配
+                    toc_lines.append(f"- {sec}")
+                    heading_tree.append({"level": 1, "title": sec, "number": ""})
 
         if toc_lines:
             page_num = self._find_page_for_position(0)

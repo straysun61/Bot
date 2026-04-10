@@ -28,29 +28,36 @@ async def handle_task(task):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
+    import os
+
     # Startup
     config = get_config()
 
     # 设置任务处理器
     set_task_handler(handle_task)
 
-    # 启动任务执行器
-    executor = get_task_executor()
-    await executor.start()
-    executor.start_workers(num_workers=2)
+    # 仅在非 Vercel 环境启动后台服务
+    if os.getenv("VERCEL") is None:
+        # 启动任务执行器
+        executor = get_task_executor()
+        await executor.start()
+        executor.start_workers(num_workers=2)
 
-    # 启动任务队列
-    queue = get_task_queue()
+        # 启动任务队列
+        queue = get_task_queue()
 
-    # 启动对话管理器
-    conv_mgr = get_conversation_manager()
-    await conv_mgr.start()
+        # 启动对话管理器
+        conv_mgr = get_conversation_manager()
+        await conv_mgr.start()
 
-    yield
+        yield
 
-    # Shutdown
-    await executor.stop()
-    await conv_mgr.stop()
+        # Shutdown
+        await executor.stop()
+        await conv_mgr.stop()
+    else:
+        # Vercel Serverless 环境
+        yield
 
 
 app = FastAPI(

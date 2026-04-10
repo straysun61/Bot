@@ -43,52 +43,48 @@ class DashScopeEmbeddings(Embeddings):
         self.base_url = base_url or settings.OPENAI_API_BASE
 
     def _call_api(self, texts: List[str]) -> List[List[float]]:
-        """调用 DashScope embedding API"""
+        """调用 DashScope embedding API，支持单条失败时逐条处理"""
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-        import time
-
-        # Debug: log what's being sent
-        total_chars = sum(len(t) for t in texts)
-        print(f"[EMBED] Sending {len(texts)} texts, total {total_chars} chars")
-
-        # Retry with exponential backoff
-        for attempt in range(3):
-            try:
-                response = httpx.post(
-                    f"{self.base_url}/embeddings",
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json={"model": self.model, "input": texts},
-                    timeout=60.0
-                )
-                if response.status_code == 400:
-                    print(f"[EMBED] 400 error, response: {response.text[:300]}")
-                    # Retry once after a short delay
-                    if attempt < 2:
-                        time.sleep(2 * (attempt + 1))
-                        continue
-                response.raise_for_status()
-                result = response.json()
-                return [item["embedding"] for item in result["data"]]
-            except httpx.HTTPStatusError as e:
-                print(f"[EMBED] HTTP error on attempt {attempt+1}: {e.response.status_code}")
-                if attempt < 2:
-                    time.sleep(2 * (attempt + 1))
-                else:
-                    raise
-            except Exception as e:
-                print(f"[EMBED] Error on attempt {attempt+1}: {e}")
-                if attempt < 2:
-                    time.sleep(2 * (attempt + 1))
-                else:
-                    raise
-
-        # Should not reach here
-        return []
+        try:
+            response = httpx.post(
+                f"{self.base_url}/embeddings",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={"model": self.model, "input": texts},
+                timeout=60.0
+            )
+            response.raise_for_status()
+            result = response.json()
+            return [item["embedding"] for item in result["data"]]
+        except httpx.HTTPStatusError as e:
+            # 批量失败时，回退到逐条调用
+            if e.response.status_code == 400 and len(texts) > 1:
+                print(f"[Embedding] 批量请求失败(400)，回退到逐条处理 {len(texts)} 条文本")
+                embeddings = []
+                for i, text in enumerate(texts):
+                    try:
+                        single_resp = httpx.post(
+                            f"{self.base_url}/embeddings",
+                            headers={
+                                "Authorization": f"Bearer {self.api_key}",
+                                "Content-Type": "application/json"
+                            },
+                            json={"model": self.model, "input": [text]},
+                            timeout=30.0
+                        )
+                        single_resp.raise_for_status()
+                        emb = single_resp.json()["data"][0]["embedding"]
+                        embeddings.append(emb)
+                        print(f"[Embedding] 第 {i+1}/{len(texts)} 条成功")
+                    except Exception as ex:
+                        print(f"[Embedding] 第 {i+1}/{len(texts)} 条失败: {ex}，使用模拟向量")
+                        embeddings.append(self._mock_embedding(text))
+                return embeddings
+            raise
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """批量嵌入文档，支持分批和重试"""
@@ -117,6 +113,12 @@ class DashScopeEmbeddings(Embeddings):
     def embed_query(self, text: str) -> List[float]:
         """嵌入单个查询"""
         return self._call_api([text])[0]
+
+    def _mock_embedding(self, text: str) -> List[float]:
+        """生成模拟向量（当 API 调用失败时使用）"""
+        import hashlib
+        hash_bytes = hashlib.md5(text.encode()).digest()
+        return [float(b) / 255.0 for b in hash_bytes[:16]] * 8
 
 
 class VisionOCR:
@@ -157,19 +159,9 @@ class VisionOCR:
 
     @classmethod
     def _call_vision(cls, image_path: str, system_prompt: str) -> str:
-        """调用视觉大模型进行 OCR"""
+        """调用视觉大模型进行 OCR（使用 httpx 直接调用，避免 openai SDK 的 proxies 问题）"""
         if not settings.OPENAI_API_KEY:
             return f"[模拟 OCR 结果] 已从图片 {os.path.basename(image_path)} 中提取文本。"
-
-        try:
-            from openai import OpenAI
-        except ImportError:
-            raise ImportError("openai 库未安装，请运行: pip install openai")
-
-        client = OpenAI(
-            api_key=settings.OPENAI_API_KEY,
-            base_url=settings.OPENAI_API_BASE
-        )
 
         actual_path = image_path
         file_size = os.path.getsize(image_path)
@@ -183,19 +175,38 @@ class VisionOCR:
         with open(actual_path, "rb") as image_file:
             image_base64 = base64.b64encode(image_file.read()).decode("utf-8")
 
-        response = client.chat.completions.create(
-            model="qwen-vl-plus",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
-                    ]
-                }
-            ],
-            max_tokens=4096
-        )
+        # 使用 httpx 直接调用，避免 openai SDK 和 httpx 版本不兼容导致的 proxies 问题
+        try:
+            response = httpx.post(
+                f"{settings.OPENAI_API_BASE}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "qwen-vl-plus",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+                            ]
+                        }
+                    ],
+                    "max_tokens": 4096
+                },
+                timeout=120.0
+            )
+            response.raise_for_status()
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+        except httpx.HTTPStatusError as e:
+            print(f"Vision OCR HTTP 错误: {e.response.status_code} - {e.response.text[:200]}")
+            raise Exception(f"Vision OCR 调用失败: {e.response.status_code}")
+        except Exception as e:
+            print(f"Vision OCR 调用异常: {str(e)}")
+            raise
 
         if actual_path != image_path and os.path.exists(actual_path):
             try:
@@ -203,7 +214,7 @@ class VisionOCR:
             except:
                 pass
 
-        return response.choices[0].message.content
+        return content
 
     @staticmethod
     def slice_long_image(image_path: str, overlap_px: int = 200, max_height: int = 4096) -> List[str]:

@@ -178,8 +178,8 @@ class DocBotRAG:
         context: str,
         system_prompt: str = ""
     ) -> str:
-        """简单生成回复（无重试）"""
-        import openai
+        """简单生成回复（无重试），使用 httpx 直接调用避免 openai SDK proxies 问题"""
+        import httpx
         from core.config import settings
 
         prompt = f"""{system_prompt or self._get_default_system_prompt()}
@@ -195,36 +195,37 @@ class DocBotRAG:
             if not settings.OPENAI_API_KEY:
                 return f"[无API Key] 基于文档内容回答: {question}"
 
-            client = openai.OpenAI(
-                api_key=settings.OPENAI_API_KEY,
-                base_url=settings.OPENAI_API_BASE or None
+            response = httpx.post(
+                f"{settings.OPENAI_API_BASE}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": settings.LLM_MODEL or "gpt-3.5-turbo",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 2000
+                },
+                timeout=60.0
             )
-            response = client.chat.completions.create(
-                model=settings.LLM_MODEL or "gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=2000
-            )
-            return response.choices[0].message.content
+            response.raise_for_status()
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
         except Exception as e:
             logger.error(f"LLM调用失败: {e}")
             return f"[LLM错误] {str(e)[:100]}"
 
     @async_timeout(30.0)
     async def _generate_answer_with_retry(self, messages: List[dict]) -> str:
-        """带超时的回复生成"""
-        try:
-            import openai
-            from core.config import settings
+        """带超时的回复生成，使用 httpx 直接调用避免 openai SDK proxies 问题"""
+        import httpx
+        from core.config import settings
 
+        try:
             if not settings.OPENAI_API_KEY:
                 last_message = messages[-1]["content"] if messages else ""
                 return f"[无API Key] {last_message[:100]}..."
-
-            client = openai.OpenAI(
-                api_key=settings.OPENAI_API_KEY,
-                base_url=settings.OPENAI_API_BASE or None
-            )
 
             # 转换 messages 格式
             chat_messages = []
@@ -238,13 +239,23 @@ class DocBotRAG:
                 elif role == "assistant":
                     chat_messages.append({"role": "assistant", "content": content})
 
-            response = client.chat.completions.create(
-                model=settings.LLM_MODEL or "gpt-3.5-turbo",
-                messages=chat_messages,
-                temperature=0.3,
-                max_tokens=2000
+            response = httpx.post(
+                f"{settings.OPENAI_API_BASE}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": settings.LLM_MODEL or "gpt-3.5-turbo",
+                    "messages": chat_messages,
+                    "temperature": 0.3,
+                    "max_tokens": 2000
+                },
+                timeout=60.0
             )
-            return response.choices[0].message.content
+            response.raise_for_status()
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
         except Exception as e:
             logger.error(f"LLM调用失败: {e}")
             last_message = messages[-1]["content"] if messages else ""

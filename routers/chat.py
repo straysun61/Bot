@@ -55,46 +55,69 @@ def build_prompt(context_docs: list, query: str) -> str:
 
 async def generate_stream_response(prompt: str, api_key: str):
     """
-    流式调用 LLM (OpenAI ChatGPT)
+    流式调用 LLM，使用 httpx 直接调用避免 openai SDK proxies 问题
     """
-    import openai
+    import httpx
 
-    client = openai.OpenAI(api_key=api_key, base_url=settings.OPENAI_API_BASE)
-
-    stream = client.chat.completions.create(
-        model=settings.LLM_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        stream=True
-    )
-
-    for chunk in stream:
-        if chunk.choices[0].delta.content:
-            yield f"data: {json.dumps({'content': chunk.choices[0].delta.content})}\n\n"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        async with client.stream(
+            "POST",
+            f"{settings.OPENAI_API_BASE}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": settings.LLM_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": True
+            }
+        ) as response:
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk_data = json.loads(data)
+                        delta = chunk_data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if delta:
+                            yield f"data: {json.dumps({'content': delta})}\n\n"
+                    except json.JSONDecodeError:
+                        continue
 
     yield f"data: {json.dumps({'done': True})}\n\n"
 
 
 async def generate_non_stream_response(prompt: str, api_key: str) -> dict:
     """
-    非流式调用 LLM
+    非流式调用 LLM，使用 httpx 直接调用避免 openai SDK proxies 问题
     """
-    import openai
+    import httpx
 
-    client = openai.OpenAI(api_key=api_key, base_url=settings.OPENAI_API_BASE)
-
-    response = client.chat.completions.create(
-        model=settings.LLM_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-        max_tokens=2000
+    response = httpx.post(
+        f"{settings.OPENAI_API_BASE}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": settings.LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 2000
+        },
+        timeout=60.0
     )
+    response.raise_for_status()
+    result = response.json()
 
     return {
-        "content": response.choices[0].message.content,
+        "content": result["choices"][0]["message"]["content"],
         "usage": {
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens
+            "prompt_tokens": result.get("usage", {}).get("prompt_tokens", 0),
+            "completion_tokens": result.get("usage", {}).get("completion_tokens", 0),
+            "total_tokens": result.get("usage", {}).get("total_tokens", 0)
         }
     }
 
