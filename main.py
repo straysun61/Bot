@@ -97,8 +97,13 @@ async def health_check():
 
 @app.get("/")
 async def root():
-    """API文档"""
-    from fastapi.responses import RedirectResponse
+    """前端页面"""
+    from fastapi.responses import FileResponse, RedirectResponse
+    import os
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    static_index = os.path.join(base_dir, "static", "index.html")
+    if os.path.exists(static_index):
+        return FileResponse(static_index)
     return RedirectResponse(url="/docs")
 
 
