@@ -14,12 +14,17 @@ build/
 # Database
 chroma_db/
 
-# Storage data (may contain sensitive uploaded files)
+# Storage data (uploaded files)
 storage/
 storage_export/
 storage_images/
 storage_md/
+storage_errors/
 
 # IDE
 .vscode/
 .idea/
+
+# OS
+.DS_Store
+Thumbs.db

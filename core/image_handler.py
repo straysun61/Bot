@@ -1,5 +1,5 @@
 """
-图片处理模块 - 负责文档中图片的提取、存储和管理
+图片处理模块 - 负责文档中图片的提取、存储、下载和管理
 完整链路：提取 -> 保存 -> MD引用 -> 导出还原
 """
 import os
@@ -8,6 +8,8 @@ import logging
 from typing import List, Dict, Optional, Tuple
 from PIL import Image
 import io
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,58 @@ class ImageHandler:
         ext = os.path.splitext(source_path)[1].lower()
 
         return self.save_image(image_data, original_name, ext.lstrip('.'))
+
+    async def download_images_from_urls(self, url_list: List[str]) -> List[ImageInfo]:
+        """
+        从外部 URL（含 Minio 带签名链接）异步下载图片并保存
+
+        Args:
+            url_list: 图片 URL 列表
+
+        Returns:
+            成功保存的 ImageInfo 列表
+        """
+        downloaded = []
+
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            for url in url_list:
+                try:
+                    response = await client.get(url)
+                    response.raise_for_status()
+
+                    image_data = response.content
+
+                    # 从 URL 或 Content-Type 推断格式
+                    image_format = "png"
+                    content_type = response.headers.get("content-type", "")
+                    if "jpeg" in content_type or "jpg" in content_type:
+                        image_format = "jpeg"
+                    elif "gif" in content_type:
+                        image_format = "gif"
+                    elif "webp" in content_type:
+                        image_format = "webp"
+
+                    # 从 URL 路径推断原始文件名
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    original_name = os.path.basename(parsed.path) or f"remote_{uuid.uuid4().hex[:8]}"
+
+                    image_info = self.save_image(
+                        image_data=image_data,
+                        original_name=original_name,
+                        image_format=image_format
+                    )
+                    downloaded.append(image_info)
+                    logger.info(f"Downloaded image from {url[:80]}... -> {image_info.stored_path}")
+
+                except httpx.HTTPStatusError as e:
+                    logger.warning(f"Failed to download {url[:80]}...: HTTP {e.response.status_code}")
+                except httpx.RequestError as e:
+                    logger.warning(f"Request error downloading {url[:80]}...: {e}")
+                except Exception as e:
+                    logger.warning(f"Unexpected error downloading {url[:80]}...: {e}")
+
+        return downloaded
 
     def get_markdown_ref(self, image_info: ImageInfo, alt_text: str = "") -> str:
         """

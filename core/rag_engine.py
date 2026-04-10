@@ -18,6 +18,9 @@ from langchain_core.embeddings import Embeddings
 import httpx
 
 from core.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
 
 # 图片处理模块
 from core.image_handler import (
@@ -63,7 +66,7 @@ class DashScopeEmbeddings(Embeddings):
         except httpx.HTTPStatusError as e:
             # 批量失败时，回退到逐条调用
             if e.response.status_code == 400 and len(texts) > 1:
-                print(f"[Embedding] 批量请求失败(400)，回退到逐条处理 {len(texts)} 条文本")
+                logger.info(f"[Embedding] 批量请求失败(400)，回退到逐条处理 {len(texts)} 条文本")
                 embeddings = []
                 for i, text in enumerate(texts):
                     try:
@@ -79,9 +82,9 @@ class DashScopeEmbeddings(Embeddings):
                         single_resp.raise_for_status()
                         emb = single_resp.json()["data"][0]["embedding"]
                         embeddings.append(emb)
-                        print(f"[Embedding] 第 {i+1}/{len(texts)} 条成功")
+                        logger.warning(f"[EMBED] Text Embedding] 第 {i+1}/{len(texts)} 条成功")
                     except Exception as ex:
-                        print(f"[Embedding] 第 {i+1}/{len(texts)} 条失败: {ex}，使用模拟向量")
+                        logger.warning(f"[EMBED] Text Embedding] 第 {i+1}/{len(texts)} 条失败: {ex}，使用模拟向量")
                         embeddings.append(self._mock_embedding(text))
                 return embeddings
             raise
@@ -97,15 +100,15 @@ class DashScopeEmbeddings(Embeddings):
                 batch_embeddings = self._call_api(batch)
                 all_embeddings.extend(batch_embeddings)
             except Exception as e:
-                print(f"[EMBED] Batch {i//batch_size} failed: {e}")
+                logger.warning(f"[EMBED] Batch {i//batch_size} failed: {e}")
                 # 尝试逐条发送，定位问题
                 for j, text in enumerate(batch):
                     try:
                         emb = self._call_api([text])
                         all_embeddings.extend(emb)
                     except Exception as e2:
-                        print(f"[EMBED] Text {i+j} failed: {e2}")
-                        print(f"[EMBED]   Text: {repr(text[:200])}")
+                        logger.warning(f"[EMBED] Text EMBED] Text {i+j} failed: {e2}")
+                        logger.warning(f"[EMBED] Text EMBED]   Text: {repr(text[:200])}")
                         # 使用零向量作为fallback
                         all_embeddings.append([0.0] * 1024)
         return all_embeddings
@@ -167,10 +170,10 @@ class VisionOCR:
         file_size = os.path.getsize(image_path)
 
         if file_size > cls.MAX_IMAGE_SIZE:
-            print(f"图片太大 ({file_size / 1024 / 1024:.1f}MB)，正在压缩...")
+            logger.info(f"图片太大 ({file_size / 1024 / 1024:.1f}MB)，正在压缩...")
             actual_path = cls._compress_image(image_path)
             compressed_size = os.path.getsize(actual_path)
-            print(f"压缩完成: {compressed_size / 1024 / 1024:.1f}MB")
+            logger.info
 
         with open(actual_path, "rb") as image_file:
             image_base64 = base64.b64encode(image_file.read()).decode("utf-8")
@@ -202,10 +205,10 @@ class VisionOCR:
             result = response.json()
             content = result["choices"][0]["message"]["content"]
         except httpx.HTTPStatusError as e:
-            print(f"Vision OCR HTTP 错误: {e.response.status_code} - {e.response.text[:200]}")
+            logger.info(f"Vision OCR HTTP 错误: {e.response.status_code} - {e.response.text[:200]}")
             raise Exception(f"Vision OCR 调用失败: {e.response.status_code}")
         except Exception as e:
-            print(f"Vision OCR 调用异常: {str(e)}")
+            logger.info(f"Vision OCR 调用异常: {str(e)}")
             raise
 
         if actual_path != image_path and os.path.exists(actual_path):
@@ -310,7 +313,7 @@ class DocumentParser:
         try:
             import pymupdf4llm
         except ImportError:
-            print("pymupdf4llm 未安装，回退到 pdfplumber...")
+            logger.info("pymupdf4llm 未安装，回退到 pdfplumber...")
             md_text, page_mappings = cls._parse_pdf_pdfplumber(file_path, doc_id)
             return md_text, page_mappings, {}
 
@@ -327,9 +330,9 @@ class DocumentParser:
                 if image_refs:
                     markdown_text = markdown_text + "\n\n" + image_refs
                 all_images = extracted_images
-                print(f"从 PDF 提取了 {len(extracted_images)} 张图片")
+                logger.info(f"从 PDF 提取了 {len(extracted_images)} 张图片")
         except Exception as img_err:
-            print(f"PDF 图片提取失败: {img_err}")
+            logger.info(f"PDF 图片提取失败: {img_err}")
 
         # 构建 page_mappings
         page_mappings = []
@@ -383,7 +386,7 @@ class DocumentParser:
                     page_text = page.extract_text() or ""
 
                     if len(page_text.strip()) < cls.MIN_TEXT_THRESHOLD:
-                        print(f"第 {page_num} 页文本量异常少，启用 Vision OCR...")
+                        logger.info(f"第 {page_num} 页文本量异常少，启用 Vision OCR...")
                         page_text = cls._parse_pdf_page_with_vision(file_path, page_num)
                     else:
                         page_text = cls._convert_to_markdown(page_text, page_num)
@@ -408,12 +411,12 @@ class DocumentParser:
                     save_image_records(doc_id, extracted_images)
                     image_refs = get_image_record_markdown(doc_id)
                     all_text.append(image_refs)
-                    print(f"从 PDF 提取了 {len(extracted_images)} 张图片")
+                    logger.info(f"从 PDF 提取了 {len(extracted_images)} 张图片")
             except Exception as img_err:
-                print(f"PDF 图片提取失败: {img_err}")
+                logger.info(f"PDF 图片提取失败: {img_err}")
 
         except Exception as e:
-            print(f"PDF 解析失败: {e}")
+            logger.info(f"PDF 解析失败: {e}")
             all_text, page_mappings = cls._parse_pdf_with_vision_fallback(file_path)
 
         return "\n\n".join(all_text), page_mappings
@@ -428,10 +431,10 @@ class DocumentParser:
             md_text, page_mappings, assets_map = cls.parse_pdf_vectorized(file_path, doc_id)
             return md_text, page_mappings
         except FallbackToOCRError:
-            print("轨道A结果为空，回退到 pdfplumber 解析...")
+            logger.info("轨道A结果为空，回退到 pdfplumber 解析...")
             return cls._parse_pdf_pdfplumber(file_path, doc_id)
         except Exception as e:
-            print(f"轨道A解析失败: {e}，回退到 pdfplumber...")
+            logger.info(f"轨道A解析失败: {e}，回退到 pdfplumber...")
             return cls._parse_pdf_pdfplumber(file_path, doc_id)
 
     @classmethod
@@ -566,7 +569,7 @@ class DocumentParser:
                     os.remove(temp_path)
 
         except Exception as e:
-            print(f"第 {page_num} 页 Vision OCR 失败: {e}")
+            logger.info(f"第 {page_num} 页 Vision OCR 失败: {e}")
             return f"[第 {page_num} 页 OCR 提取失败]"
 
     @classmethod
@@ -701,9 +704,9 @@ class DocumentParser:
                             # 用文件名和完整路径都建立映射
                             rId_to_image[fname] = img_info
                         except Exception as e:
-                            print(f"提取图片失败 {mf}: {e}")
+                            logger.info(f"提取图片失败 {mf}: {e}")
         except Exception as e:
-            print(f"无法打开 DOCX ZIP: {e}")
+            logger.info(f"无法打开 DOCX ZIP: {e}")
 
         # Step 2: 建立 rId -> 图片文件名 映射（从文档关系）
         rId_to_filename = {}
@@ -807,7 +810,7 @@ class DocumentParser:
         # 记录图片
         if handler.images:
             save_image_records(doc_id, handler.images)
-            print(f"从 DOCX 提取了 {len(handler.images)} 张图片")
+            logger.info(f"从 DOCX 提取了 {len(handler.images)} 张图片")
 
         return md_text, mappings
 
@@ -1101,7 +1104,7 @@ class RAGEngine:
             representations = doc_bot.extractor.extract(markdown_text, doc_id, page_mappings)
             doc_bot.vector_store.add_representations(representations)
         except Exception as e:
-            print(f"表示抽取失败: {e}")
+            logger.info(f"表示抽取失败: {e}")
             import traceback
             traceback.print_exc()
 
@@ -1277,11 +1280,11 @@ class RAGEngine:
 
         if child_docs_to_add:
             self.vectorstore.add_documents(child_docs_to_add)
-            print(f"[RAG] Added {len(child_docs_to_add)} child docs to vectorstore")
+            logger.info(f"[EMBED] Text RAG] Added {len(child_docs_to_add)} child docs to vectorstore")
 
         if docstore_kv_pairs:
             self.retriever.docstore.mset(docstore_kv_pairs)
-            print(f"[RAG] Added {len(docstore_kv_pairs)} parent docs to docstore")
+            logger.info(f"[EMBED] Text RAG] Added {len(docstore_kv_pairs)} parent docs to docstore")
 
     def _self_verify(self, markdown: str, image_records: list) -> List[str]:
         """

@@ -101,7 +101,8 @@ class SSEClient:
                     user_prompt=event_data.get("user_prompt", ""),
                     image_list=event_data.get("image_list", []),
                     task_type=event_data.get("task_type", "general_chat"),
-                    metadata=event_data.get("metadata", {})
+                    metadata=event_data.get("metadata", {}),
+                    callback_url=event_data.get("callback_url")
                 )
 
                 if self.on_task_received:
