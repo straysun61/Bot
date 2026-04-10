@@ -23,10 +23,11 @@ class TaskQueue:
 
     async def put(self, task: TaskInstruction) -> None:
         """将任务加入队列"""
-        # 初始化任务状态
+        # 初始化任务状态，透传 metadata（含 callback_url, access_token）
         self._tasks[task.task_id] = TaskResult(
             task_id=task.task_id,
-            status=TaskStatus.PENDING
+            status=TaskStatus.PENDING,
+            metadata=task.metadata.copy() if task.metadata else {}
         )
         await self._queue.put(task)
         logger.info(f"Task {task.task_id} added to queue")

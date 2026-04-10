@@ -2,6 +2,7 @@
 机器人统一架构 - FastAPI应用入口
 """
 from contextlib import asynccontextmanager
+import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +16,8 @@ from core.bot import (
     get_conversation_manager,
     webhook_router,
     set_task_handler,
+    create_sse_client,
+    get_sse_client,
 )
 from routers import auth, documents, chat, doc_bot, bot_router, export
 
@@ -50,9 +53,28 @@ async def lifespan(app: FastAPI):
         conv_mgr = get_conversation_manager()
         await conv_mgr.start()
 
+        # 启动 SSE 客户端连接 Message Server
+        config = get_config()
+        sse_endpoint = config.sse_endpoint
+        sse_token = os.getenv("SSE_TOKEN", "")
+        if sse_endpoint:
+            sse_client = create_sse_client(
+                endpoint=sse_endpoint,
+                token=sse_token,
+                on_task_received=handle_task
+            )
+            await sse_client.start()
+            logger.info(f"SSE client connected to {sse_endpoint}")
+
         yield
 
         # Shutdown
+        # 关闭 SSE 客户端
+        sse_client = get_sse_client()
+        if sse_client:
+            await sse_client.stop()
+            logger.info("SSE client disconnected")
+
         await executor.stop()
         await conv_mgr.stop()
     else:

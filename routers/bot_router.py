@@ -5,7 +5,7 @@ Bot API路由
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from core.bot import (
@@ -19,6 +19,7 @@ from core.bot import (
     get_tier_manager,
     get_skill_executor,
 )
+from core.security import verify_api_key
 
 router = APIRouter(prefix="/api/v1/bot", tags=["Bot"])
 
@@ -71,7 +72,10 @@ class SkillInfo(BaseModel):
 
 
 @router.post("/tasks", response_model=SubmitTaskResponse)
-async def submit_task(request: SubmitTaskRequest) -> SubmitTaskResponse:
+async def submit_task(
+    request: SubmitTaskRequest,
+    _auth: str = Depends(verify_api_key)
+) -> SubmitTaskResponse:
     """提交新任务"""
     task_id = str(uuid.uuid4())
 
@@ -97,7 +101,10 @@ async def submit_task(request: SubmitTaskRequest) -> SubmitTaskResponse:
 
 
 @router.get("/tasks/{task_id}/status", response_model=TaskStatusResponse)
-async def get_task_status(task_id: str) -> TaskStatusResponse:
+async def get_task_status(
+    task_id: str,
+    _auth: str = Depends(verify_api_key)
+) -> TaskStatusResponse:
     """获取任务状态"""
     queue = get_task_queue()
     result = queue.get_task_status(task_id)
@@ -168,7 +175,8 @@ async def get_config_info() -> dict:
 async def execute_skill(
     skill_name: str,
     user_prompt: str = "",
-    metadata: dict = {}
+    metadata: dict = {},
+    _auth: str = Depends(verify_api_key)
 ) -> dict:
     """
     直接执行技能（不经过任务队列）

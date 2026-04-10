@@ -1,0 +1,53 @@
+services:
+  bot:
+    build: .
+    container_name: doc-bot
+    env_file:
+      - .env
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./storage:/app/storage
+      - ./storage_md:/app/storage_md
+      - ./storage_images:/app/storage_images
+      - ./storage_errors:/app/storage_errors
+      - ./storage_export:/app/storage_export
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - botnet
+
+  nginx:
+    image: nginx:alpine
+    container_name: doc-bot-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      bot:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - botnet
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: doc-bot-tunnel
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - nginx
+    restart: unless-stopped
+    networks:
+      - botnet
+
+networks:
+  botnet:
+    driver: bridge

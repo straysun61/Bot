@@ -35,6 +35,7 @@ class TaskInstruction(BaseModel):
     image_sequence: Optional[List[str]] = Field(default=None, description="连续图片路径列表（用于多图接力）")
     task_type: str = Field(default="general_chat", description="任务类型")
     metadata: dict[str, Any] = Field(default_factory=dict, description="元数据")
+    callback_url: Optional[str] = Field(default=None, description="动态回调地址（由Message Server下发）")
 
     class Config:
         json_schema_extra = {
@@ -59,6 +60,7 @@ class TaskResult(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     compute_tier: str = "free"
+    metadata: dict[str, Any] = Field(default_factory=dict, description="透传元数据（含callback_url）")
 
     class Config:
         json_schema_extra = {

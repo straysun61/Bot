@@ -78,9 +78,10 @@ class TaskExecutor:
         # 记录请求
         self.rate_limiter.record_request()
 
-        # 添加回调URL到元数据
-        if callback_url:
-            task.metadata["callback_url"] = callback_url
+        # 优先使用动态 callback_url（SSE 下发），其次使用传入参数
+        effective_callback_url = task.callback_url or callback_url
+        if effective_callback_url:
+            task.metadata["callback_url"] = effective_callback_url
 
         # 加入队列
         await self.queue.put(task)
@@ -152,12 +153,37 @@ class TaskExecutor:
 
     async def _run_task_handler(self, task: TaskInstruction) -> any:
         """
-        运行任务处理函数（默认实现）
-        子类可以覆盖此方法实现自定义处理逻辑
+        运行任务处理函数
+        先下载外部资源，再调用 SkillExecutor 自动分发到对应技能
         """
-        # 默认实现：模拟任务执行
-        await asyncio.sleep(0.1)
-        return {"status": "processed", "task_id": task.task_id}
+        from core.bot.skill_executor import get_skill_executor
+        from core.image_handler import ImageHandler
+
+        # 1. 预处理：下载外部带签名的各类图片（如 Minio URL）
+        if task.image_list:
+            remote_urls = [url for url in task.image_list if url.startswith("http")]
+            if remote_urls:
+                handler = ImageHandler(doc_id=task.task_id)
+                downloaded_images = await handler.download_images_from_urls(remote_urls)
+                
+                # 替换原始 URL 为本地路径
+                new_image_list = []
+                down_idx = 0
+                for url in task.image_list:
+                    if url.startswith("http"):
+                        if down_idx < len(downloaded_images):
+                            new_image_list.append(downloaded_images[down_idx].stored_path)
+                            down_idx += 1
+                        else:
+                            # 下载失败，丢弃或保留原样均可，这里保留原样
+                            new_image_list.append(url)
+                    else:
+                        new_image_list.append(url)
+                task.image_list = new_image_list
+
+        # 2. 调用具体的业务技能分发器
+        skill_executor = get_skill_executor()
+        return await skill_executor.execute_task(task)
 
     async def _trigger_callback(self, task_id: str) -> None:
         """触发任务回调"""
@@ -166,7 +192,10 @@ class TaskExecutor:
             return
 
         callback_url = result.metadata.get("callback_url")
-        await self.callback_handler.send_completion_callback(result, callback_url)
+        access_token = result.metadata.get("access_token")
+        await self.callback_handler.send_completion_callback(
+            result, callback_url, access_token
+        )
 
     async def _handle_timeout(self, task_id: str, timeout_seconds: int) -> None:
         """处理任务超时"""
@@ -183,7 +212,11 @@ class TaskExecutor:
                 )
 
                 logger.warning(f"Task {task_id} timed out")
-                await self._trigger_callback(task_id)
+                callback_url = result.metadata.get("callback_url")
+                access_token = result.metadata.get("access_token")
+                await self.callback_handler.send_timeout_callback(
+                    task_id, callback_url, access_token
+                )
 
         except asyncio.CancelledError:
             pass
