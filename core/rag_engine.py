@@ -813,25 +813,60 @@ class DocumentParser:
 
     @classmethod
     def parse_doc(cls, file_path: str) -> Tuple[str, List[dict]]:
-        """从 Word .doc 文件提取文本（需要 Windows + Microsoft Word）"""
-        try:
-            import win32com.client
-            import pythoncom
-            pythoncom.CoInitialize()
+        """从 Word .doc 文件提取文本（支持 Windows 和 Linux）"""
+        import platform
+        system = platform.system()
+
+        # Windows: 使用 win32com
+        if system == "Windows":
             try:
-                word = win32com.client.Dispatch("Word.Application")
-                word.Visible = False
-                doc = word.Documents.Open(os.path.abspath(file_path))
-                text = doc.Content.Text
-                doc.Close(False)
-                word.Quit()
-                return cls._text_to_markdown(text)
-            finally:
-                pythoncom.CoUninitialize()
-        except ImportError:
-            raise ImportError("pywin32 未安装，请运行: pip install pywin32")
-        except Exception as e:
-            raise Exception(f"无法解析 .doc 文件: {str(e)}")
+                import win32com.client
+                import pythoncom
+                pythoncom.CoInitialize()
+                try:
+                    word = win32com.client.Dispatch("Word.Application")
+                    word.Visible = False
+                    doc = word.Documents.Open(os.path.abspath(file_path))
+                    text = doc.Content.Text
+                    doc.Close(False)
+                    word.Quit()
+                    return cls._text_to_markdown(text)
+                finally:
+                    pythoncom.CoUninitialize()
+            except ImportError:
+                raise ImportError("pywin32 未安装，请运行: pip install pywin32")
+            except Exception as e:
+                raise Exception(f"无法解析 .doc 文件: {str(e)}")
+
+        # Linux: 使用 antiword 或 doc2txt
+        else:
+            import shutil
+            import subprocess
+
+            # 尝试 antiword
+            if shutil.which("antiword"):
+                try:
+                    result = subprocess.run(
+                        ["antiword", "-w", "0", os.path.abspath(file_path)],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if result.returncode == 0:
+                        return cls._text_to_markdown(result.stdout)
+                except Exception:
+                    pass
+
+            # 尝试 doc2txt
+            try:
+                import doc2txt
+                text = doc2txt.process(os.path.abspath(file_path))
+                if text.strip():
+                    return cls._text_to_markdown(text)
+            except ImportError:
+                pass
+
+            raise Exception(
+                "无法解析 .doc 文件，请在 Linux 上安装 antiword: sudo apt install antiword"
+            )
 
     @classmethod
     def _text_to_markdown(cls, text: str) -> Tuple[str, List[dict]]:
