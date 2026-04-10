@@ -838,35 +838,27 @@ class DocumentParser:
             except Exception as e:
                 raise Exception(f"无法解析 .doc 文件: {str(e)}")
 
-        # Linux: 使用 antiword 或 doc2txt
+        # Linux: 使用 antiword
         else:
             import shutil
             import subprocess
 
-            # 尝试 antiword
-            if shutil.which("antiword"):
-                try:
-                    result = subprocess.run(
-                        ["antiword", "-w", "0", os.path.abspath(file_path)],
-                        capture_output=True, text=True, timeout=30
-                    )
-                    if result.returncode == 0:
-                        return cls._text_to_markdown(result.stdout)
-                except Exception:
-                    pass
+            if not shutil.which("antiword"):
+                raise Exception("antiword 未安装，请在 Railway Build Command 中添加: apt-get install -y antiword")
 
-            # 尝试 doc2txt
             try:
-                import doc2txt
-                text = doc2txt.process(os.path.abspath(file_path))
-                if text.strip():
-                    return cls._text_to_markdown(text)
-            except ImportError:
-                pass
-
-            raise Exception(
-                "无法解析 .doc 文件，请在 Linux 上安装 antiword: sudo apt install antiword"
-            )
+                result = subprocess.run(
+                    ["antiword", "-w", "0", os.path.abspath(file_path)],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return cls._text_to_markdown(result.stdout)
+                else:
+                    raise Exception(f"antiword 解析失败，返回码: {result.returncode}")
+            except subprocess.TimeoutExpired:
+                raise Exception("antiword 解析超时")
+            except Exception as e:
+                raise Exception(f"无法解析 .doc 文件: {str(e)}")
 
     @classmethod
     def _text_to_markdown(cls, text: str) -> Tuple[str, List[dict]]:
