@@ -177,14 +177,14 @@ async def chat_completion(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"未找到文档: {request.doc_id}"
                 )
-            # 使用多表示检索获取完整上下文
-            context_docs = rag_engine.retrieve_with_expansion(request.query, k=3)
+            # 使用混合搜索获取完整上下文
+            context_docs = rag_engine.hybrid_search(request.query, k=3, mode="hybrid")
             # 过滤只保留指定 doc_id 的文档
             context_docs = [doc for doc in context_docs
                           if doc.metadata.get("doc_id") == request.doc_id]
         else:
-            # Step 2: 从整个知识库检索
-            context_docs = rag_engine.retrieve_with_expansion(request.query, k=5)
+            # Step 2: 从整个知识库检索（混合搜索）
+            context_docs = rag_engine.hybrid_search(request.query, k=5, mode="hybrid")
 
         # Step 3: 构建 Prompt
         prompt = build_prompt(context_docs, request.query)

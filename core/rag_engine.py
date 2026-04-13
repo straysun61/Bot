@@ -19,8 +19,105 @@ import httpx
 
 from core.config import settings
 import logging
+import pickle
 
 logger = logging.getLogger(__name__)
+
+
+class BM25Retriever:
+    """
+    BM25 关键词检索器，支持持久化到磁盘
+    """
+
+    def __init__(self, persist_path: str):
+        self.persist_path = persist_path
+        self.doc_store: list[tuple[str, str, dict]] = []  # [(doc_id, text, metadata), ...]
+        self.index = None
+        self._tokenized_corpus: list[list[str]] = []
+        self._loaded = False
+
+    def _tokenize(self, text: str) -> list[str]:
+        """简单分词（按字符级别，适合中文）"""
+        # 简单按标点和空格分词
+        import re
+        tokens = re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z0-9]+', text)
+        return [t.lower() for t in tokens if len(t) > 1]
+
+    def add_documents(self, documents: list[Document]) -> None:
+        """添加文档到 BM25 索引"""
+        from rank_bm25 import BM25L
+
+        texts = [doc.page_content for doc in documents]
+        metadatas = [doc.metadata for doc in documents]
+        doc_ids = [meta.get("doc_id", "") or meta.get("parent_id", "") for meta in metadatas]
+
+        # 追加到 doc_store
+        for doc_id, text, meta in zip(doc_ids, texts, metadatas):
+            self.doc_store.append((doc_id, text, meta))
+
+        # 重新构建索引
+        tokenized = [self._tokenize(text) for text in texts]
+        self._tokenized_corpus = tokenized
+
+        if tokenized:
+            self.index = BM25L(tokenized)
+        else:
+            self.index = None
+
+    def save(self) -> None:
+        """持久化索引到磁盘"""
+        import os
+        os.makedirs(os.path.dirname(self.persist_path) or ".", exist_ok=True)
+        with open(self.persist_path, "wb") as f:
+            pickle.dump({
+                "doc_store": self.doc_store,
+                "tokenized_corpus": self._tokenized_corpus,
+            }, f)
+        logger.info(f"[BM25] 索引已保存到 {self.persist_path}，共 {len(self.doc_store)} 条")
+
+    def load(self) -> None:
+        """从磁盘加载索引"""
+        import os
+        if not os.path.exists(self.persist_path):
+            logger.info("[BM25] 索引文件不存在，将从头构建")
+            return
+
+        try:
+            with open(self.persist_path, "rb") as f:
+                data = pickle.load(f)
+            self.doc_store = data["doc_store"]
+            self._tokenized_corpus = data["tokenized_corpus"]
+
+            if self._tokenized_corpus:
+                from rank_bm25 import BM25L
+                self.index = BM25L(self._tokenized_corpus)
+            logger.info(f"[BM25] 索引已加载，共 {len(self.doc_store)} 条")
+        except Exception as e:
+            logger.warning(f"[BM25] 索引加载失败: {e}，将重新构建")
+            self.doc_store = []
+            self._tokenized_corpus = []
+            self.index = None
+
+    def search(self, query: str, k: int = 5) -> list[Document]:
+        """搜索返回 top-k 相关文档"""
+        if not self.index or not self._tokenized_corpus:
+            return []
+
+        query_tokens = self._tokenize(query)
+        scores = self.index.get_scores(query_tokens)
+
+        # 按分数排序，取 top-k
+        doc_scores = list(enumerate(scores))
+        doc_scores.sort(key=lambda x: x[1], reverse=True)
+
+        results = []
+        for idx, score in doc_scores[:k]:
+            if score > 0:
+                doc_id, text, meta = self.doc_store[idx]
+                doc = Document(page_content=text, metadata=meta)
+                results.append(doc)
+
+        return results
 
 # 图片处理模块
 from core.image_handler import (
@@ -1011,7 +1108,7 @@ class DocumentParser:
 class RAGEngine:
     """
     RAG 引擎核心类
-    使用 LangChain + Chroma 实现多表示索引
+    使用 LangChain + Chroma 实现多表示索引 + BM25 混合搜索
     """
 
     def __init__(self):
@@ -1019,6 +1116,13 @@ class RAGEngine:
         self.vectorstore = self._init_vectorstore()
         self.id_key = "doc_id"
         self.retriever = self._init_retriever()
+        self.bm25_retriever = self._init_bm25_retriever()
+
+    def _init_bm25_retriever(self) -> BM25Retriever:
+        """初始化 BM25 检索器"""
+        bm25_retriever = BM25Retriever(persist_path=settings.BM25_PERSIST_PATH)
+        bm25_retriever.load()
+        return bm25_retriever
 
     def _init_embeddings(self):
         """初始化 Embedding 模型"""
@@ -1282,6 +1386,12 @@ class RAGEngine:
             self.vectorstore.add_documents(child_docs_to_add)
             logger.info(f"[EMBED] Text RAG] Added {len(child_docs_to_add)} child docs to vectorstore")
 
+            # 同步构建 BM25 索引
+            if settings.BM25_ENABLED:
+                self.bm25_retriever.add_documents(child_docs_to_add)
+                self.bm25_retriever.save()
+                logger.info(f"[BM25] 已将 {len(child_docs_to_add)} 个子文档加入 BM25 索引")
+
         if docstore_kv_pairs:
             self.retriever.docstore.mset(docstore_kv_pairs)
             logger.info(f"[EMBED] Text RAG] Added {len(docstore_kv_pairs)} parent docs to docstore")
@@ -1341,6 +1451,64 @@ class RAGEngine:
     def get_document_by_id(self, doc_id: str) -> list[Document]:
         """根据 doc_id 获取文档的所有块"""
         return self.vectorstore.get(where={"doc_id": doc_id})
+
+    def _rrf_fusion(self, vector_results: list[Document], bm25_results: list[Document], k: int = 60) -> list[Document]:
+        """
+        Reciprocal Rank Fusion (RRF): 融合向量检索和 BM25 检索结果
+        score = Σ 1/(k + rank)
+        """
+        from collections import defaultdict
+
+        doc_map: dict[str, Document] = {}
+        for doc in vector_results:
+            doc_map[doc.page_content] = doc
+        for doc in bm25_results:
+            doc_map[doc.page_content] = doc
+
+        scores: dict[str, float] = defaultdict(float)
+
+        for rank, doc in enumerate(vector_results):
+            scores[doc.page_content] += 1.0 / (k + rank + 1)
+
+        for rank, doc in enumerate(bm25_results):
+            scores[doc.page_content] += 1.0 / (k + rank + 1)
+
+        sorted_contents = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return [doc_map[content] for content, _ in sorted_contents]
+
+    def hybrid_search(self, query: str, k: int = 5, mode: str = "hybrid") -> list[Document]:
+        """
+        混合搜索入口
+
+        Args:
+            query: 查询文本
+            k: 返回结果数量
+            mode: 'vector' | 'bm25' | 'hybrid' (默认 hybrid)
+                - vector: 仅向量检索
+                - bm25: 仅 BM25 关键词检索
+                - hybrid: RRF 融合向量 + BM25
+        """
+        if mode == "vector":
+            return self.vectorstore.similarity_search(query, k=k)
+
+        elif mode == "bm25":
+            return self.bm25_retriever.search(query, k=k)
+
+        else:  # hybrid
+            # 扩展检索数量，避免融合后结果太少
+            expand_k = k * 3
+            vector_results = self.vectorstore.similarity_search(query, k=expand_k)
+            bm25_results = self.bm25_retriever.search(query, k=expand_k)
+
+            if not vector_results and not bm25_results:
+                return []
+            if not vector_results:
+                return bm25_results[:k]
+            if not bm25_results:
+                return vector_results[:k]
+
+            fused = self._rrf_fusion(vector_results, bm25_results, k=60)
+            return fused[:k]
 
 
 # 全局 RAG 引擎实例

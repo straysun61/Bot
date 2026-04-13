@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     # 向量数据库配置
     CHROMA_DB_PATH: str = "./chroma_db"
 
+    # BM25 配置
+    BM25_ENABLED: bool = True
+    BM25_PERSIST_PATH: str = "./chroma_db/bm25_index.pkl"
+
     # 文档处理配置
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 50
