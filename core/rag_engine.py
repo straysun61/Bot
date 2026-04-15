@@ -24,6 +24,64 @@ import pickle
 logger = logging.getLogger(__name__)
 
 
+class RerankerClient:
+    """
+    Reranker 客户端，调用远程 rerank 服务进行二阶段重排
+    """
+
+    def __init__(self, reranker_url: str):
+        self.reranker_url = reranker_url.rstrip("/")
+        self.rerank_endpoint = f"{self.reranker_url}/rerank"
+
+    def rerank(self, query: str, documents: list[Document], top_n: int = 5) -> list[Document]:
+        """
+        对文档列表进行重排
+
+        Args:
+            query: 查询文本
+            documents: RRF 融合后的候选文档列表
+            top_n: 返回的 top n 结果
+
+        Returns:
+            重排后的文档列表
+        """
+        if not documents:
+            return []
+
+        doc_texts = [doc.page_content for doc in documents]
+
+        try:
+            import httpx
+            response = httpx.post(
+                self.rerank_endpoint,
+                json={
+                    "query": query,
+                    "documents": doc_texts,
+                    "top_n": top_n
+                },
+                timeout=60.0
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            results = result.get("results", [])
+            # 按 relevance_score 降序排序
+            results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+
+            reranked = []
+            for item in results[:top_n]:
+                idx = item.get("index")
+                if idx is not None and 0 <= idx < len(documents):
+                    reranked.append(documents[idx])
+
+            logger.info(f"[RERANK] 重排完成，输入 {len(documents)} 条，输出 {len(reranked)} 条")
+            return reranked
+
+        except Exception as e:
+            logger.warning(f"[RERANK] 重排失败: {e}，返回 RRF 结果")
+            return documents[:top_n]
+
+
 class BM25Retriever:
     """
     BM25 关键词检索器，支持持久化到磁盘
@@ -1117,6 +1175,11 @@ class RAGEngine:
         self.id_key = "doc_id"
         self.retriever = self._init_retriever()
         self.bm25_retriever = self._init_bm25_retriever()
+        self.reranker = self._init_reranker()
+
+    def _init_reranker(self) -> RerankerClient:
+        """初始化 Reranker 客户端"""
+        return RerankerClient(reranker_url=settings.RERANKER_URL)
 
     def _init_bm25_retriever(self) -> BM25Retriever:
         """初始化 BM25 检索器"""
@@ -1476,7 +1539,7 @@ class RAGEngine:
         sorted_contents = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return [doc_map[content] for content, _ in sorted_contents]
 
-    def hybrid_search(self, query: str, k: int = 5, mode: str = "hybrid") -> list[Document]:
+    def hybrid_search(self, query: str, k: int = 5, mode: str = "hybrid", use_rerank: bool = True) -> list[Document]:
         """
         混合搜索入口
 
@@ -1487,28 +1550,34 @@ class RAGEngine:
                 - vector: 仅向量检索
                 - bm25: 仅 BM25 关键词检索
                 - hybrid: RRF 融合向量 + BM25
+            use_rerank: 是否使用 Reranker 二阶段重排（默认 True）
         """
         if mode == "vector":
-            return self.vectorstore.similarity_search(query, k=k)
-
+            results = self.vectorstore.similarity_search(query, k=k)
         elif mode == "bm25":
-            return self.bm25_retriever.search(query, k=k)
-
+            results = self.bm25_retriever.search(query, k=k)
         else:  # hybrid
             # 扩展检索数量，避免融合后结果太少
-            expand_k = k * 3
+            expand_k = max(k * 3, 20)
             vector_results = self.vectorstore.similarity_search(query, k=expand_k)
             bm25_results = self.bm25_retriever.search(query, k=expand_k)
 
             if not vector_results and not bm25_results:
                 return []
             if not vector_results:
-                return bm25_results[:k]
-            if not bm25_results:
-                return vector_results[:k]
+                results = bm25_results
+            elif not bm25_results:
+                results = vector_results
+            else:
+                fused = self._rrf_fusion(vector_results, bm25_results, k=60)
+                # RRF 融合后取 2*k 条送 reranker，留足够候选
+                results = fused[:k * 2]
 
-            fused = self._rrf_fusion(vector_results, bm25_results, k=60)
-            return fused[:k]
+        # 第二阶段：Reranker 精排
+        if use_rerank and settings.RERANKER_ENABLED and results:
+            results = self.reranker.rerank(query, results, top_n=k)
+
+        return results[:k]
 
 
 # 全局 RAG 引擎实例

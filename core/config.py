@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     BM25_ENABLED: bool = True
     BM25_PERSIST_PATH: str = "./chroma_db/bm25_index.pkl"
 
+    # Reranker 配置
+    RERANKER_URL: str = "http://100.64.1.5:13001"
+    RERANKER_ENABLED: bool = True
+    RERANKER_TOP_N: int = 5
+
     # 文档处理配置
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 50
