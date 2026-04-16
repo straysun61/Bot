@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "qwen-plus"
     EMBEDDING_MODEL: str = "text-embedding-v3"
 
+    # === SimpleTex 专业公式识别 API ===
+    SIMPLETEX_API_KEY: str = ""
+
     # 向量数据库配置
     CHROMA_DB_PATH: str = "./chroma_db"
 

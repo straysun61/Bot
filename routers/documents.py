@@ -76,6 +76,12 @@ def process_document_task(doc_id: str, file_path: str, file_extension: str, user
         # 检查是否有自校对警告
         warnings = result.get("verification_warnings", [])
 
+        # 保存警告信息到文件（供状态查询使用）
+        if warnings:
+            warnings_file = os.path.join(MD_STORAGE_DIR, f"{doc_id}.warnings")
+            with open(warnings_file, "w", encoding="utf-8") as f:
+                json.dump(warnings, f, ensure_ascii=False)
+
         task_manager.complete(doc_id, {
             "markdown_path": md_file_path,
             "mappings_path": mappings_file_path,
@@ -243,12 +249,22 @@ async def get_document_status(doc_id: str):
 
     # 检查是否完成
     if os.path.exists(md_file_path):
-        return {
+        result = {
             "doc_id": doc_id,
             "status": TaskStatus.COMPLETED.value,
             "description": "Document processed and Markdown saved.",
             "md_path": md_file_path
         }
+        # 检查是否有警告
+        warnings_file = os.path.join(MD_STORAGE_DIR, f"{doc_id}.warnings")
+        if os.path.exists(warnings_file):
+            try:
+                with open(warnings_file, "r", encoding="utf-8") as f:
+                    result["warnings"] = json.load(f)
+                    result["status"] = "warning"
+            except Exception:
+                pass
+        return result
 
     # 检查是否有错误文件
     if os.path.exists(error_file_path):
@@ -410,3 +426,68 @@ async def get_page_mappings(doc_id: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"读取页码映射失败: {str(e)}"
         )
+
+
+@router.delete("/{doc_id}")
+async def delete_document(doc_id: str):
+    """
+    删除文档及其所有相关数据（Markdown、向量、错误记录等）
+    """
+    import logging
+    import json
+    logger = logging.getLogger(__name__)
+
+    deleted_files = []
+
+    # 1. 删除 Markdown 文件
+    md_file = os.path.join(MD_STORAGE_DIR, f"{doc_id}.md")
+    if os.path.exists(md_file):
+        os.remove(md_file)
+        deleted_files.append(md_file)
+
+    # 2. 删除页码映射
+    mappings_file = os.path.join(MD_STORAGE_DIR, f"{doc_id}_mappings.json")
+    if os.path.exists(mappings_file):
+        os.remove(mappings_file)
+        deleted_files.append(mappings_file)
+
+    # 3. 删除警告文件
+    warnings_file = os.path.join(MD_STORAGE_DIR, f"{doc_id}.warnings")
+    if os.path.exists(warnings_file):
+        os.remove(warnings_file)
+        deleted_files.append(warnings_file)
+
+    # 4. 删除错误记录
+    error_file = os.path.join(ERROR_DIR, f"{doc_id}.error")
+    if os.path.exists(error_file):
+        os.remove(error_file)
+        deleted_files.append(error_file)
+
+    timeout_error_file = os.path.join(ERROR_DIR, f"{doc_id}.timeout_error")
+    if os.path.exists(timeout_error_file):
+        os.remove(timeout_error_file)
+        deleted_files.append(timeout_error_file)
+
+    # 5. 从 ChromaDB 中删除该文档的所有向量
+    try:
+        rag_engine = get_rag_engine()
+        collection = rag_engine.vectorstore._collection
+        collection.delete(where={"doc_id": doc_id})
+        logger.info(f"已从 ChromaDB 删除 doc_id={doc_id} 的向量数据")
+    except Exception as e:
+        logger.warning(f"从 ChromaDB 删除 doc_id={doc_id} 失败: {e}")
+
+    # 6. 从 doc_bot 向量存储中删除
+    try:
+        from core.doc_bot import get_doc_bot_v2
+        doc_bot = get_doc_bot_v2()
+        collection = doc_bot.vectorstore._collection
+        collection.delete(where={"doc_id": doc_id})
+        logger.info(f"已从 doc_bot ChromaDB 删除 doc_id={doc_id} 的向量数据")
+    except Exception as e:
+        logger.warning(f"从 doc_bot ChromaDB 删除 doc_id={doc_id} 失败: {e}")
+
+    return {
+        "message": f"文档 {doc_id} 已删除",
+        "deleted_files": deleted_files
+    }

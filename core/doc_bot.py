@@ -138,15 +138,40 @@ class MultiRepresentationExtractor:
             title_summary = " | ".join([h[1] for h in headings[:5]])
             section_count = len(headings)
 
-        # 关键词
-        words = re.findall(r'[\w]{2,}', md_content.lower())
-        word_freq = {}
-        stopwords = {'的', '是', '在', '和', '了', '是', '有', '我', '你', '他', '这', '那', '个', '与', '及', '或', '等', '为', '以', '及', '于', '上', '下', '中', '可以', '这个', '一个', '以及', '通过', '进行', '其中'}
-        for word in words:
-            if word not in stopwords and len(word) > 1:
-                word_freq[word] = word_freq.get(word, 0) + 1
+        # 关键词：提取中文词汇 + 英文术语
+        # 策略：中文二字/三字词 + 英文专业术语 + 过滤停用词
+        text_only = re.sub(r'!\[.*?\]\(.*?\)', '', md_content)  # 去除图片引用
+        text_only = re.sub(r'[#|*`]', ' ', text_only)  # 去除 markdown 标记
 
-        top_keywords = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:10]
+        # 过滤掉文件路径碎片和hex ID（如 storage_images, bb7c1cd0, a4f64）
+        text_only = re.sub(r'\b[a-f0-9]{4,}\b', ' ', text_only)  # hex ID
+        text_only = re.sub(r'\b(storage_images|storage_md|storage|chroma|download|temp|tmp)\b', ' ', text_only)
+
+        # 提取中文词（连续2-4个汉字，排除单字和停用词）
+        chinese_stopwords = {'的', '了', '是', '在', '和', '有', '我', '你', '他', '这', '那', '个', '与', '及', '或', '等', '为', '以', '于', '上', '下', '中', '可以', '这个', '一个', '以及', '通过', '进行', '其中', '我们', '他们', '所有', '没有', '因为', '所以', '但是', '如果', '已经', '非常', '其他', '自己', '什么', '怎么', '怎样', '时候', '时候', '一些', '一种', '一些', '之间', '之间', '之后', '之前', '以上', '以下', '以内', '以外', '有关', '关于', '对于', '对于', '由于', '为了', '为了', '不能', '不会', '不是', '不用', '不同', '不可', '不是', '不能', '不会', '所有', '各种', '各种', '全部', '全部', '全部'}
+        cn_words = re.findall(r'[\u4e00-\u9fff]{2,4}', text_only)
+        cn_freq = {}
+        for w in cn_words:
+            if w not in chinese_stopwords and len(w) >= 2:
+                cn_freq[w] = cn_freq.get(w, 0) + 1
+
+        # 提取英文术语（连续字母+数字，至少3字符）
+        en_words = re.findall(r'[a-zA-Z][a-zA-Z0-9]{2,}', text_only)
+        en_stopwords = {'the', 'and', 'for', 'from', 'with', 'this', 'that', 'have', 'been', 'was', 'are', 'were', 'been', 'been', 'been', 'been', 'not', 'but', 'they', 'their', 'has', 'was', 'will', 'each', 'make', 'like', 'just', 'over', 'such', 'also', 'back', 'after', 'use', 'two', 'how', 'our', 'work', 'first', 'well', 'way', 'even', 'new', 'want', 'because', 'any', 'these', 'give', 'day', 'most', 'us', 'been', 'get', 'got', 'going', 'go', 'going', 'done', 'made', 'said', 'does', 'did', 'say', 'says', 'going', 'like', 'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'ide', 'test', 'tests', 'unit', 'junit', 'service', 'services'}
+        en_freq = {}
+        for w in en_words:
+            wl = w.lower()
+            if wl not in en_stopwords and len(wl) >= 3:
+                en_freq[wl] = en_freq.get(wl, 0) + 1
+
+        # 合并排序
+        all_keywords = {}
+        for w, c in cn_freq.items():
+            all_keywords[w] = c * 2  # 中文权重更高
+        for w, c in en_freq.items():
+            all_keywords[w] = all_keywords.get(w, 0) + c
+
+        top_keywords = sorted(all_keywords.items(), key=lambda x: x[1], reverse=True)[:10]
         keywords = ", ".join([w[0] for w in top_keywords])
 
         # 摘要
@@ -154,7 +179,7 @@ class MultiRepresentationExtractor:
         preview_text = " ".join(lines[:3])[:200]
         page_num = self._find_page_for_position(0)
 
-        summary = f"文档包含 {section_count} 个章节，{len(words)} 个词汇。"
+        summary = f"文档包含 {section_count} 个章节，{len(cn_freq) + len(en_freq)} 个关键词。"
         if preview_text:
             summary += f"\n\n内容预览：{preview_text}..."
 
@@ -270,7 +295,7 @@ class MultiRepresentationExtractor:
         return representations
 
     def _extract_structure(self, md_content: str, doc_id: str) -> List[Representation]:
-        """抽取结构表示：标题层级、目录、表格"""
+        """抽取结构表示：标题层级、目录、表格、图片页"""
         representations = []
 
         # 1. 提取目录
@@ -278,20 +303,53 @@ class MultiRepresentationExtractor:
         toc_lines = []
         heading_tree = []
 
-        for h in headings:
-            level = len(h[0])
-            indent = "  " * (level - 1)
-            toc_lines.append(f"{indent}- {h[1]}")
-            heading_tree.append({"level": level, "title": h[1]})
+        # headings 是 (hash_marks, title) 的元组列表
+        # 过滤掉纯页面标记（如 "第 1 页"），只保留有意义的标题
+        meaningful_headings = [(h, len(h), t) for h, t in headings
+                               if not re.match(r'第\s*\d+\s*页', t.strip())
+                               and t.strip() != '文档图片']
 
-        if not headings:
-            # 匹配格式如 "1.1 在OEM中创建..." 或 "任务1：..." 或 "三、实验内容"
-            numbered_sections = re.findall(r'^(\d+[.、：:]\s*[^\n]{0,80})', md_content, re.MULTILINE)
-            for sec in numbered_sections:
+        for _hash, level, title in meaningful_headings:
+            indent = "  " * (level - 1)
+            toc_lines.append(f"{indent}- {title}")
+            heading_tree.append({"level": level, "title": title})
+
+        # 如果 markdown 标题不够，从正文中提取中文结构标题
+        if len(meaningful_headings) < 3:
+            # 匹配 "一、二、三、" 等中文序号标题（去重）
+            seen_sections = set()
+            cn_sections = re.findall(r'^([一二三四五六七八九十百]+[、.]\s*[^\n]{0,80})', md_content, re.MULTILINE)
+            for sec in cn_sections:
                 sec = sec.strip()
-                if len(sec) > 5:  # 过滤太短的匹配
+                if 3 < len(sec) <= 60 and sec not in seen_sections:
                     toc_lines.append(f"- {sec}")
-                    heading_tree.append({"level": 1, "title": sec, "number": ""})
+                    heading_tree.append({"level": 1, "title": sec})
+                    seen_sections.add(sec)
+
+            # 匹配 "3.1、3.2" 等数字层级标题（去重）
+            num_sections = re.findall(r'^(\d+\.\d+[、.\s]\s*[^\n]{0,80})', md_content, re.MULTILINE)
+            for sec in num_sections:
+                sec = sec.strip()
+                if 3 < len(sec) <= 60 and sec not in seen_sections:
+                    toc_lines.append(f"  - {sec}")
+                    heading_tree.append({"level": 2, "title": sec})
+                    seen_sections.add(sec)
+
+        # 如果还是没有标题，提取图片页作为结构
+        if not toc_lines:
+            page_pattern = re.compile(r'# 第 (\d+) 页')
+            page_matches = page_pattern.findall(md_content)
+            for pm in page_matches:
+                toc_lines.append(f"- 第 {pm} 页 (含图片)")
+                heading_tree.append({"level": 1, "title": f"第 {pm} 页", "page_num": int(pm)})
+
+        # 如果还是没有结构，提取文档中的段落作为结构
+        if not toc_lines:
+            paragraphs = [p.strip() for p in re.split(r'\n{2,}', md_content) if p.strip() and len(p.strip()) > 10]
+            for para in paragraphs[:10]:
+                summary = para[:50] + "..." if len(para) > 50 else para
+                toc_lines.append(f"- {summary}")
+                heading_tree.append({"level": 1, "title": summary})
 
         if toc_lines:
             page_num = self._find_page_for_position(0)

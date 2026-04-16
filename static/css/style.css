@@ -283,6 +283,11 @@ body::before {
     color: #991b1b;
 }
 
+.file-status.warning {
+    background: #fef3c7;
+    color: #92400e;
+}
+
 /* 进度区域 */
 .progress-area {
     background: var(--card);
@@ -514,6 +519,30 @@ body::before {
 
 .toast.error {
     background: var(--error);
+}
+
+.toast.warning {
+    background: #f59e0b;
+}
+
+.action-btn.delete-btn {
+    background: transparent;
+    border: none;
+    color: #999;
+    cursor: pointer;
+    padding: 6px;
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+.action-btn.delete-btn:hover {
+    color: #ef4444;
+    background: #fee2e2;
+}
+
+.action-btn.delete-btn svg {
+    width: 18px;
+    height: 18px;
 }
 
 /* 操作按钮 */

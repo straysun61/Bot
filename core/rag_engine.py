@@ -279,10 +279,159 @@ class DashScopeEmbeddings(Embeddings):
         return [float(b) / 255.0 for b in hash_bytes[:16]] * 8
 
 
-class VisionOCR:
-    """视觉大模型 OCR 处理器 - 使用阿里云百炼 qwen-vl-plus"""
+class ImagePreprocessor:
+    """
+    优化方案 1: 针对手写理科作业的图像预处理通道
 
-    SYSTEM_PROMPT = """你是一个顶级的 OCR 与排版复原专家。请识别并提取出图片里的所有文本，特别是手写文字，如实复现，不要编造。保持原有的排版格式，如果有多栏布局请保持栏序。"""
+    使用 OpenCV 对图像进行多步提纯：
+    - 灰度化 + CLAHE（对比度受限自适应直方图均衡）提亮淡墨水
+    - 自适应二值化（高斯/均值）漂白背景
+    - 形态学膨胀加深笔画边缘
+    - 可选去噪（中值滤波）
+    """
+
+    @staticmethod
+    def preprocess(image_path: str, strategy: str = "science") -> str:
+        """
+        图像预处理入口。
+
+        Args:
+            image_path: 原始图片路径
+            strategy: 预处理策略
+                - "science": 理科公式优化（强对比度 + 形态学加粗）
+                - "general": 通用文字（温和增强）
+                - "faint_ink": 淡墨水增强（极端对比度）
+
+        Returns:
+            预处理后的图片路径（临时文件，调用方负责清理）
+        """
+        try:
+            import cv2
+        except ImportError:
+            logger.warning("OpenCV 未安装，跳过图像预处理")
+            return image_path
+
+        img = cv2.imread(image_path)
+        if img is None:
+            logger.warning(f"无法读取图片: {image_path}")
+            return image_path
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        if strategy == "science":
+            processed = ImagePreprocessor._science_preprocess(gray)
+        elif strategy == "faint_ink":
+            processed = ImagePreprocessor._faint_ink_preprocess(gray)
+        else:
+            processed = ImagePreprocessor._general_preprocess(gray)
+
+        # 保存为临时 PNG 文件
+        import tempfile
+        temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        temp_path = temp_file.name
+        temp_file.close()
+        cv2.imwrite(temp_path, processed, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+        logger.info(f"图像预处理完成 [{strategy}]: {image_path} -> {temp_path}")
+        return temp_path
+
+    @staticmethod
+    def _clahe_enhance(gray: "np.ndarray", clip_limit: float = 2.0, tile_size: int = 8) -> "np.ndarray":
+        """CLAHE 对比度增强，解决局部曝光不均"""
+        import numpy as np
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
+        return clahe.apply(gray)
+
+    @staticmethod
+    def _adaptive_threshold(gray: "np.ndarray", block_size: int = 25, C: int = 10) -> "np.ndarray":
+        """自适应二值化 - 高斯加权"""
+        return cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, block_size, C
+        )
+
+    @staticmethod
+    def _morphological_bold(binary: "np.ndarray", kernel_size: int = 2) -> "np.ndarray":
+        """形态学膨胀：加深笔画边缘，使化学脚标/物理角标更清晰"""
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+        # 先膨胀后腐蚀（闭运算），填补笔画内部空洞
+        return cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    @staticmethod
+    def _denoise(gray: "np.ndarray", kernel: int = 3) -> "np.ndarray":
+        """中值滤波去噪，去除椒盐噪声"""
+        return cv2.medianBlur(gray, kernel)
+
+    @staticmethod
+    def _science_preprocess(gray: "np.ndarray") -> "np.ndarray":
+        """理科公式优化流程：CLAHE → 自适应二值化 → 形态学加粗"""
+        enhanced = ImagePreprocessor._clahe_enhance(gray, clip_limit=3.0, tile_size=8)
+        denoised = ImagePreprocessor._denoise(enhanced, kernel=3)
+        binary = ImagePreprocessor._adaptive_threshold(denoised, block_size=31, C=8)
+        bold = ImagePreprocessor._morphological_bold(binary, kernel_size=2)
+        return bold
+
+    @staticmethod
+    def _faint_ink_preprocess(gray: "np.ndarray") -> "np.ndarray":
+        """淡墨水极端增强：强力 CLAHE → 自适应二值化 → 粗膨胀"""
+        enhanced = ImagePreprocessor._clahe_enhance(gray, clip_limit=5.0, tile_size=16)
+        denoised = ImagePreprocessor._denoise(enhanced, kernel=5)
+        binary = ImagePreprocessor._adaptive_threshold(denoised, block_size=51, C=5)
+        bold = ImagePreprocessor._morphological_bold(binary, kernel_size=3)
+        return bold
+
+    @staticmethod
+    def _general_preprocess(gray: "np.ndarray") -> "np.ndarray":
+        """通用温和增强：轻度 CLAHE → 轻微二值化"""
+        enhanced = ImagePreprocessor._clahe_enhance(gray, clip_limit=1.5, tile_size=8)
+        return enhanced
+
+
+class VisionOCR:
+    """
+    视觉大模型 OCR 处理器 - 使用阿里云百炼 qwen-vl-max
+    优化后支持：
+    - 图像预处理（CLAHE + 自适应二值化 + 形态学）
+    - Few-Shot 多模态注入（化学/物理/数学高质量范例）
+    - 双轨降级（VLM → SimpleTex 公式识别）
+    """
+
+    # ==================== 核心 System Prompt ====================
+
+    SYSTEM_PROMPT = """你是一个专精于高中理科手写作业 OCR 与公式排版的顶级引擎。
+请严格遵守以下规则提取图片中的所有信息：
+
+【排版规则】
+1. 绝对忠实原文：如实识别每一行文本，不得总结、删减或编造。
+2. 多栏排版：如果有多栏或左右排版，根据语义逻辑转换为从上到下的阅读顺序。
+3. 层级结构：遇到"一、计算题""二、填空题"等大纲，使用 Markdown 标题（##/###）标记。
+
+【公式规范 - 严格执行】
+4. 所有数学/物理/化学公式统一用 $$ 包裹的标准 LaTeX 格式输出：
+   - 分数：$$ \\frac{分子}{分母} $$  （禁止使用 1/20 等纯文本）
+   - 幂/下标：$$ v_{0}^{2} $$、$$ F_{N} $$、$$ H_{2}O $$
+   - 物理向量：$$ \\vec{F} $$、$$ \\overrightarrow{AB} $$
+   - 求和/积分：$$ \\sum_{i=1}^{n} $$、$$ \\int_{a}^{b} $$
+
+【学科特殊规则】
+5. 化学方程式：必须用 LaTeX 化学环境或标准公式格式
+   - 反应条件写在箭头上方：$$ \\xrightarrow[\\text{加热}]{\\text{MnO}_2} $$
+   - 气体/沉淀：$$ \\uparrow $$、$$ \\downarrow $$
+   - 化学键：单键 -，双键 =，三键 ≡
+   - 示例：$$ 2H_2O_2 \\xrightarrow{MnO_2} 2H_2O + O_2 \\uparrow $$
+
+6. 物理受力分析：
+   - 力的表示：$$ F_N $$（支持力）、$$ f $$（摩擦力）、$$ mg $$（重力）
+   - 牛顿第二定律：$$ \\sum \\vec{F} = m\\vec{a} $$
+   - 动能定理：$$ W = \\Delta E_k = \\frac{1}{2}mv^2 - \\frac{1}{2}mv_0^2 $$
+
+7. 生物：
+   - 基因型：$$ AaBb $$、$$ X^B X^b $$
+   - 细胞分裂：用箭头表示过程
+
+【手写特有标记处理】
+8. 补充插入：箭头指向旁边的补充文字，根据语义插入到正文对应位置。
+9. 涂抹/涂改：被完全涂黑的文字忽略，部分涂改用 ~~删除线~~ 标记。
+10. 随意勾画：与解题无关的随意涂鸦、划线全部忽略，不输出。"""
 
     RELAY_SYSTEM_PROMPT = """{base_prompt}
 
@@ -297,27 +446,156 @@ class VisionOCR:
 
     MAX_IMAGE_SIZE = 10 * 1024 * 1024
 
+    # ==================== 双轨配置 ====================
+    # SimpleTex API 配置（专业公式识别引擎）
+    SIMPLETEX_API_URL = "https://simpletex.cn/api/v1/ocr"
+    SIMPLETEX_API_KEY = ""  # 在 .env 中配置 SIMPLETEX_API_KEY
+    VLM_TIMEOUT_THRESHOLD = 90  # VLM 超时阈值（秒），超过则降级
+    FORMULA_DENSITY_THRESHOLD = 0.3  # 公式密度阈值，VLM 输出中公式占比低于此值时触发降级
+
     @classmethod
-    def extract_text_from_image(cls, image_path: str) -> str:
+    def extract_text_from_image(cls, image_path: str, preprocess: bool = True, strategy: str = "science") -> str:
+        """
+        从图片中提取文本（入口方法）
+
+        Args:
+            image_path: 图片路径
+            preprocess: 是否进行图像预处理（默认开启）
+            strategy: 预处理策略 ("science" / "faint_ink" / "general")
+        """
+        if preprocess:
+            try:
+                processed_path = ImagePreprocessor.preprocess(image_path, strategy)
+                if processed_path != image_path:
+                    try:
+                        result = cls._call_vision(processed_path, cls.SYSTEM_PROMPT)
+                    finally:
+                        if os.path.exists(processed_path):
+                            os.remove(processed_path)
+                    return result
+            except Exception as e:
+                logger.warning(f"图像预处理失败，使用原图: {e}")
+
         return cls._call_vision(image_path, cls.SYSTEM_PROMPT)
 
     @classmethod
     async def extract_with_context(
-        cls, image_path: str, context: str = "", is_continuation: bool = False
+        cls, image_path: str, context: str = "", is_continuation: bool = False,
+        preprocess: bool = True, strategy: str = "science"
     ) -> str:
         """带接力上下文的 OCR"""
-        if is_continuation and context:
-            prompt = cls.RELAY_SYSTEM_PROMPT.format(
-                base_prompt=cls.SYSTEM_PROMPT,
-                previous_summary=context
-            )
-        else:
-            prompt = cls.SYSTEM_PROMPT
+        prompt = cls.RELAY_SYSTEM_PROMPT.format(
+            base_prompt=cls.SYSTEM_PROMPT,
+            previous_summary=context
+        ) if (is_continuation and context) else cls.SYSTEM_PROMPT
+
+        if preprocess:
+            try:
+                processed_path = ImagePreprocessor.preprocess(image_path, strategy)
+                if processed_path != image_path:
+                    try:
+                        return cls._call_vision(processed_path, prompt)
+                    finally:
+                        if os.path.exists(processed_path):
+                            os.remove(processed_path)
+            except Exception as e:
+                logger.warning(f"图像预处理失败，使用原图: {e}")
+
         return cls._call_vision(image_path, prompt)
 
     @classmethod
-    def _call_vision(cls, image_path: str, system_prompt: str) -> str:
-        """调用视觉大模型进行 OCR（使用 httpx 直接调用，避免 openai SDK 的 proxies 问题）"""
+    def _build_messages(cls, image_base64: str, system_prompt: str) -> list:
+        """
+        优化方案 2: 构建包含 Few-Shot 范例的多模态消息
+        """
+        # Few-Shot 示例 1: 化学方程式 + 物理公式混合
+        example_chemistry_physics = """【输入图片内容】这是一张高中物理+化学作业的手写扫描件，包含：
+- 一道物理计算题（关于牛顿第二定律的受力分析）
+- 一个化学方程式（实验室制取氧气）
+
+【期望输出】
+## 物理计算题
+
+已知物体质量 $$ m = 2 \\text{kg} $$，在水平面上受到拉力 $$ F = 10 \\text{N} $$，摩擦系数 $$ \\mu = 0.3 $$。
+
+### 受力分析
+物体受力情况：
+- 重力：$$ G = mg = 2 \\times 9.8 = 19.6 \\text{N} $$
+- 支持力：$$ F_N = G = 19.6 \\text{N} $$
+- 摩擦力：$$ f = \\mu F_N = 0.3 \\times 19.6 = 5.88 \\text{N} $$
+- 合外力：$$ F_{合} = F - f = 10 - 5.88 = 4.12 \\text{N} $$
+
+由牛顿第二定律：
+$$ a = \\frac{F_{合}}{m} = \\frac{4.12}{2} = 2.06 \\text{m/s}^2 $$
+
+## 化学实验
+
+实验室用双氧水制取氧气：
+$$ 2H_2O_2 \\xrightarrow{MnO_2} 2H_2O + O_2 \\uparrow $$
+
+反应条件：二氧化锰催化，常温下即可进行。
+收集方法：排水法或向上排空气法。"""
+
+        # Few-Shot 示例 2: 数学推导 + 涂抹处理
+        example_math = """【输入图片内容】这是一张数学作业手写件，包含：
+- 分数运算推导
+- 部分被涂改的字迹
+- 旁边有箭头补充
+
+【期望输出】
+## 计算题
+
+$$ \\frac{3}{4} + \\frac{1}{6} = \\frac{9}{12} + \\frac{2}{12} = \\frac{11}{12} $$
+
+解方程：
+$$ \\frac{x}{3} + \\frac{x}{4} = 7 $$
+
+$$ \\frac{4x + 3x}{12} = 7 $$
+
+$$ \\frac{7x}{12} = 7 $$
+
+$$ x = 12 $$
+
+验证：$$ \\frac{12}{3} + \\frac{12}{4} = 4 + 3 = 7 \\checkmark $$
+
+## 应用题
+
+（被涂改的部分已忽略）
+
+补充：乙单独做需要 $$ 10 $$ 小时完成。
+设总工作量为 $$ 1 $$，则甲的工作效率为 $$ \\frac{1}{20} $$，乙的工作效率为 $$ \\frac{1}{10} $$。
+
+两人合作完成时间：
+$$ 1 \\div \\left( \\frac{1}{20} + \\frac{1}{10} \\right) = 1 \\div \\frac{3}{20} = \\frac{20}{3} \\text{小时} $$"""
+
+        return [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": "以下是一个化学+物理作业的手写图片识别示例，请学习这种输出格式："
+            },
+            {"role": "assistant", "content": example_chemistry_physics},
+            {
+                "role": "user",
+                "content": "以下是另一个数学作业的手写识别示例，注意公式格式和涂抹处理："
+            },
+            {"role": "assistant", "content": example_math},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+                ]
+            },
+        ]
+
+    @classmethod
+    def _call_vision(cls, image_path: str, system_prompt: str, use_few_shot: bool = True) -> str:
+        """
+        调用视觉大模型进行 OCR
+
+        优化方案 2: 使用 Few-Shot 示例构建消息
+        优化方案 3: 内置超时降级到 SimpleTex API
+        """
         if not settings.OPENAI_API_KEY:
             return f"[模拟 OCR 结果] 已从图片 {os.path.basename(image_path)} 中提取文本。"
 
@@ -327,52 +605,109 @@ class VisionOCR:
         if file_size > cls.MAX_IMAGE_SIZE:
             logger.info(f"图片太大 ({file_size / 1024 / 1024:.1f}MB)，正在压缩...")
             actual_path = cls._compress_image(image_path)
-            compressed_size = os.path.getsize(actual_path)
-            logger.info
 
         with open(actual_path, "rb") as image_file:
             image_base64 = base64.b64encode(image_file.read()).decode("utf-8")
 
-        # 使用 httpx 直接调用，避免 openai SDK 和 httpx 版本不兼容导致的 proxies 问题
+        # 构建消息（带 Few-Shot）
+        messages = cls._build_messages(image_base64, system_prompt) if use_few_shot else [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}]},
+        ]
+
+        # 优化方案 3: 双轨调用 - 先尝试 VLM，超时则降级到 SimpleTex
         try:
+            import concurrent.futures
+
+            def call_vlm():
+                response = httpx.post(
+                    f"{settings.OPENAI_API_BASE}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "qwen-vl-max",
+                        "messages": messages,
+                        "max_tokens": 4096
+                    },
+                    timeout=cls.VLM_TIMEOUT_THRESHOLD
+                )
+                response.raise_for_status()
+                result = response.json()
+                return result["choices"][0]["message"]["content"]
+
+            # 在线程池中执行 VLM 调用（带超时控制）
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(call_vlm)
+                try:
+                    content = future.result(timeout=cls.VLM_TIMEOUT_THRESHOLD + 10)
+                    logger.info("VLM OCR 调用成功")
+                    return content
+                except concurrent.futures.TimeoutError:
+                    logger.warning(f"VLM OCR 超时（>{cls.VLM_TIMEOUT_THRESHOLD}s），降级到 SimpleTex...")
+                    return cls._fallback_to_sciencetex(actual_path)
+
+        except httpx.HTTPStatusError as e:
+            logger.warning(f"VLM OCR HTTP 错误: {e.response.status_code}，降级到 SimpleTex...")
+            return cls._fallback_to_sciencetex(actual_path)
+        except Exception as e:
+            logger.warning(f"VLM OCR 调用异常: {e}，降级到 SimpleTex...")
+            return cls._fallback_to_sciencetex(actual_path)
+        finally:
+            if actual_path != image_path and os.path.exists(actual_path):
+                try:
+                    os.remove(actual_path)
+                except:
+                    pass
+
+    @classmethod
+    def _fallback_to_sciencetex(cls, image_path: str) -> str:
+        """
+        优化方案 3: 专业公式识别 API 降级（SimpleTex）
+        当 VLM 超时或失败时，使用 SimpleTex 识别公式
+        """
+        api_key = getattr(settings, 'SIMPLETEX_API_KEY', '') or cls.SIMPLETEX_API_KEY
+
+        if not api_key:
+            logger.warning("SimpleTex API 未配置，返回降级提示")
+            return "[公式识别服务暂时不可用，请检查配置]"
+
+        try:
+            import base64
+            with open(image_path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
             response = httpx.post(
-                f"{settings.OPENAI_API_BASE}/chat/completions",
+                cls.SIMPLETEX_API_URL,
                 headers={
-                    "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": "qwen-vl-plus",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
-                            ]
-                        }
-                    ],
-                    "max_tokens": 4096
+                    "image": img_b64,
+                    "formula": True,  # 启用公式识别
+                    "lang": "zh"
                 },
-                timeout=120.0
+                timeout=30.0
             )
             response.raise_for_status()
             result = response.json()
-            content = result["choices"][0]["message"]["content"]
+
+            if result.get("code") == 200 or result.get("status") == "success":
+                markdown = result.get("markdown", result.get("result", ""))
+                logger.info(f"SimpleTex 公式识别成功，提取 {len(markdown)} 字符")
+                return markdown
+            else:
+                logger.warning(f"SimpleTex 返回异常: {result}")
+                return "[公式识别失败]"
+
         except httpx.HTTPStatusError as e:
-            logger.info(f"Vision OCR HTTP 错误: {e.response.status_code} - {e.response.text[:200]}")
-            raise Exception(f"Vision OCR 调用失败: {e.response.status_code}")
+            logger.warning(f"SimpleTex HTTP 错误: {e.response.status_code}")
+            return "[公式识别服务暂时不可用]"
         except Exception as e:
-            logger.info(f"Vision OCR 调用异常: {str(e)}")
-            raise
-
-        if actual_path != image_path and os.path.exists(actual_path):
-            try:
-                os.remove(actual_path)
-            except:
-                pass
-
-        return content
+            logger.warning(f"SimpleTex 调用异常: {e}")
+            return "[公式识别服务暂时不可用]"
 
     @staticmethod
     def slice_long_image(image_path: str, overlap_px: int = 200, max_height: int = 4096) -> List[str]:
@@ -436,8 +771,8 @@ class VisionOCR:
 
     @classmethod
     def extract_text_from_pdf_page_image(cls, page_image_path: str) -> str:
-        """从 PDF 页面图片中提取文本"""
-        return cls.extract_text_from_image(page_image_path)
+        """从 PDF 页面图片中提取文本（理科优化模式）"""
+        return cls.extract_text_from_image(page_image_path, preprocess=True, strategy="science")
 
 
 class DocumentParser:
@@ -458,6 +793,8 @@ class DocumentParser:
         """
         轨道A: 使用 PyMuPDF4LLM 解析矢量PDF
         保留表格结构和图片引用
+
+        对于文本层缺失/稀少的页面（扫描件/图片页），自动触发 Vision OCR 补充。
 
         Returns:
             (markdown_text, page_mappings, assets_map)
@@ -488,6 +825,13 @@ class DocumentParser:
                 logger.info(f"从 PDF 提取了 {len(extracted_images)} 张图片")
         except Exception as img_err:
             logger.info(f"PDF 图片提取失败: {img_err}")
+
+        # === 检测并 OCR 图像-only 页面 ===
+        ocr_text_parts = cls._ocr_image_only_pages(file_path, markdown_text)
+        if ocr_text_parts:
+            ocr_append = "\n\n".join(ocr_text_parts)
+            markdown_text = markdown_text + "\n\n## OCR 补充内容\n\n" + ocr_append
+            logger.info(f"Vision OCR 补充了 {len(ocr_text_parts)} 个页面的内容")
 
         # 构建 page_mappings
         page_mappings = []
@@ -726,6 +1070,72 @@ class DocumentParser:
         except Exception as e:
             logger.info(f"第 {page_num} 页 Vision OCR 失败: {e}")
             return f"[第 {page_num} 页 OCR 提取失败]"
+
+    @classmethod
+    def _ocr_image_only_pages(cls, file_path: str, markdown_text: str) -> List[str]:
+        """
+        检测 PDF 中文本层缺失/稀少的页面，使用 Vision OCR 补充。
+
+        对每一页检查 fitz.Page.get_text() 返回的字符数，
+        如果低于阈值，则渲染为图片并调用 Vision OCR。
+
+        Args:
+            file_path: PDF 文件路径
+            markdown_text: pymupdf4llm 已提取的 Markdown 文本（用于对照）
+
+        Returns:
+            OCR 补充文本列表，每项格式为 "### 第 N 页\n{ocr_text}"
+        """
+        try:
+            import fitz
+        except ImportError:
+            return []
+
+        ocr_results = []
+        temp_paths = []
+
+        try:
+            pdf_document = fitz.open(file_path)
+
+            for page_num in range(len(pdf_document)):
+                page = pdf_document[page_num]
+                page_text = page.get_text() or ""
+
+                # 如果页面文本量低于阈值，判定为图片页，需要 OCR
+                if len(page_text.strip()) < cls.MIN_TEXT_THRESHOLD:
+                    logger.info(f"第 {page_num + 1} 页文本量不足 ({len(page_text.strip())} 字符)，启用 Vision OCR...")
+
+                    # 渲染为图片
+                    mat = fitz.Matrix(2.0, 2.0)
+                    pix = page.get_pixmap(matrix=mat)
+
+                    temp_image = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                    temp_path = temp_image.name
+                    temp_image.close()
+                    pix.save(temp_path)
+                    temp_paths.append(temp_path)
+
+                    # 调用 Vision OCR
+                    try:
+                        ocr_text = VisionOCR.extract_text_from_pdf_page_image(temp_path)
+                        if ocr_text.strip():
+                            ocr_results.append(f"### 第 {page_num + 1} 页\n\n{ocr_text.strip()}")
+                            logger.info(f"第 {page_num + 1} 页 OCR 完成，提取 {len(ocr_text.strip())} 字符")
+                        else:
+                            logger.info(f"第 {page_num + 1} 页 OCR 返回空结果")
+                    except Exception as ocr_err:
+                        logger.warning(f"第 {page_num + 1} 页 Vision OCR 失败: {ocr_err}")
+
+            pdf_document.close()
+
+        finally:
+            for temp_path in temp_paths:
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+
+        return ocr_results
 
     @classmethod
     def _parse_pdf_with_vision_fallback(cls, file_path: str) -> Tuple[str, List[dict]]:
@@ -1481,6 +1891,13 @@ class RAGEngine:
 
         # 统计表格
         md_tables = re.findall(r'\|.*?\|.*?\n\|[-:|]+\|', markdown)
+        expected_tables = len([r for r in image_records if hasattr(r, 'asset_type') and getattr(r, 'asset_type', None) == 'table'])
+
+        if expected_tables > 0 and len(md_tables) != expected_tables:
+            warnings.append(
+                f"TABLE_MISMATCH: 提取了{expected_tables}个表格，"
+                f"但Markdown中只找到{len(md_tables)}个"
+            )
 
         return warnings
 

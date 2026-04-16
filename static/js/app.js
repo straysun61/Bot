@@ -40,6 +40,15 @@ function showToast(message, type = 'info') {
     }, 3000);
 }
 
+// 显示警告信息
+function showWarnings(warnings) {
+    if (!warnings || warnings.length === 0) return;
+
+    const warningMsg = warnings.join('\n');
+    showToast(`处理完成但有警告: ${warningMsg.substring(0, 100)}...`, 'warning');
+    console.warn('[文档处理警告]', warnings);
+}
+
 // 获取文件类型标签
 function getFileTypeLabel(ext) {
     const labels = {
@@ -264,6 +273,9 @@ function renderFileList() {
                 <button class="action-btn download-btn" onclick="downloadContent('${fileData.docId}', '${escapeHtml(fileData.name)}')">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                     下载
+                </button>
+                <button class="action-btn delete-btn" onclick="deleteDocument('${fileData.docId}', '${fileId}', '${escapeHtml(fileData.name)}')" title="删除文档">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                 </button>
                 <div class="action-btn export-btn" style="position:relative;">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
@@ -1002,6 +1014,41 @@ function downloadContent(docId, filename) {
     window.open(`${API_BASE}/documents/${docId}/download?format=md`, '_blank');
 }
 
+// 删除文档
+async function deleteDocument(docId, fileId, filename) {
+    if (!confirm(`确定要删除文档 "${filename}" 吗？\n\n此操作将删除文档的所有数据（包括AI处理结果），不可恢复。`)) {
+        return;
+    }
+
+    try {
+        showToast('正在删除文档...', 'info');
+
+        const response = await fetch(`${API_BASE}/documents/${docId}`, {
+            method: 'DELETE'
+        });
+
+        if (!response.ok) {
+            throw new Error('删除失败');
+        }
+
+        // 从本地状态中移除
+        files.delete(fileId);
+        aiProcessedDocs.delete(docId);
+
+        renderFileList();
+
+        // 如果当前正在查看该文档的概览，关闭概览面板
+        const overviewPanel = document.getElementById('overviewPanel');
+        if (overviewPanel && overviewPanel.dataset.docId === docId) {
+            closeOverviewPanel();
+        }
+
+        showToast('文档已删除', 'success');
+    } catch (error) {
+        showToast(`删除失败: ${error.message}`, 'error');
+    }
+}
+
 // 导出文档
 async function handleExport(docId, filename, format) {
     try {
@@ -1358,6 +1405,28 @@ async function pollDocumentStatus(fileId, docId) {
                     progressArea.style.display = 'none';
                 }, 1500);
                 showToast('文档处理完成!', 'success');
+
+                // 显示警告信息（如有）
+                if (result.warnings && result.warnings.length > 0) {
+                    showWarnings(result.warnings);
+                }
+                return { success: true, warnings: result.warnings || [] };
+            }
+
+            // 处理警告状态（处理成功但有asset不匹配等问题）
+            if (result.status === 'warning') {
+                updateProgress(100, '处理完成 (有警告)');
+                updateFileStatus(fileId, 'warning');
+                addToHistory(files.get(fileId));
+                setTimeout(() => {
+                    progressArea.style.display = 'none';
+                }, 1500);
+
+                if (result.warnings && result.warnings.length > 0) {
+                    showWarnings(result.warnings);
+                } else {
+                    showToast('文档处理完成', 'success');
+                }
                 return { success: true, warnings: result.warnings || [] };
             }
 
